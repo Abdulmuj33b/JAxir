@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+
+# Secrets
+*.key
+*.pem
+*.secret
+secrets/
+credentials/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
