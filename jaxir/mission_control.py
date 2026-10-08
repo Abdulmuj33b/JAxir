@@ -59,13 +59,17 @@ class MissionSnapshot:
             "human_actions": list(self.human_actions),
         }
 
+    def to_json(self) -> str:
+        import json
+        return json.dumps(self.to_dict(), indent=2)
+
 
 class MissionControl:
     """Operational summary for Goal Mode and execution loops.
 
     This is intentionally lightweight and does not duplicate the state machine.
     It reads the goal/task/evidence state already managed by the kernel and
-displays a concise operational dashboard for operators.
+    displays a concise operational dashboard for operators.
     """
 
     def __init__(self, goal: Optional[Any] = None, tasks: Optional[Iterable[Any]] = None,
@@ -91,10 +95,22 @@ displays a concise operational dashboard for operators.
             return MissionSnapshot()
 
         total = len(self.tasks)
-        completed = sum(1 for t in self.tasks if getattr(t, "status", None) and str(t.status).lower() == "completed")
-        failed = sum(1 for t in self.tasks if getattr(t, "status", None) and str(t.status).lower() == "failed")
-        passed = sum(1 for e in self.evidence if getattr(e, "status", None) and str(e.status).upper() == "PASS")
-        failed_evidence = sum(1 for e in self.evidence if getattr(e, "status", None) and str(e.status).upper() == "FAIL")
+        completed = sum(
+            1 for t in self.tasks
+            if getattr(t, "status", None) and str(t.status).lower() == "completed"
+        )
+        failed = sum(
+            1 for t in self.tasks
+            if getattr(t, "status", None) and str(t.status).lower() == "failed"
+        )
+        passed = sum(
+            1 for e in self.evidence
+            if getattr(e, "status", None) and str(e.status).upper() == "PASS"
+        )
+        failed_evidence = sum(
+            1 for e in self.evidence
+            if getattr(e, "status", None) and str(e.status).upper() == "FAIL"
+        )
 
         progress = 0.0
         if total > 0:
@@ -104,7 +120,11 @@ displays a concise operational dashboard for operators.
             goal_id=getattr(self.goal, "goal_id", None),
             project_id=getattr(self.goal, "project_id", None),
             title=getattr(self.goal, "title", ""),
-            status=getattr(self.goal, "status", "UNKNOWN").value if hasattr(getattr(self.goal, "status", None), "value") else str(getattr(self.goal, "status", "UNKNOWN")),
+            status=(
+                getattr(self.goal, "status", "UNKNOWN").value
+                if hasattr(getattr(self.goal, "status", None), "value")
+                else str(getattr(self.goal, "status", "UNKNOWN"))
+            ),
             progress_percent=progress,
             tasks_total=total,
             tasks_completed=completed,
@@ -126,9 +146,9 @@ displays a concise operational dashboard for operators.
     def _preview_status(self) -> str:
         if not self.evidence:
             return "not_started"
-        for e in self.evidence:
-            if getattr(e, "test_id", "") == "qa.preview":
-                return "passed" if str(getattr(e, "status", "NOT_RUN")).upper() == "PASS" else "failed"
+        for evidence in self.evidence:
+            if getattr(evidence, "test_id", "") == "qa.preview":
+                return "passed" if str(getattr(evidence, "status", "NOT_RUN")).upper() == "PASS" else "failed"
         return "pending"
 
     def summary(self) -> Dict[str, Any]:
