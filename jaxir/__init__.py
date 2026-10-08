@@ -18,12 +18,14 @@ __all__ = [
     "events",
     "observability",
     "checkpoint",
+    "mission_control",
+    "traceability",
     # kernel
     "state",
     "taskgraph",
     "orchestrator",
     # goal mode
-    "goalemode",
+    "goalmode",
     "spec",
     # model runtime
     "omniroute",
