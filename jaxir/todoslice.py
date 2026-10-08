@@ -17,6 +17,7 @@ from typing import Any, Dict, List, Optional
 from . import models, goalmode, orchestrator, sandbox, preview, qa, checkpoint, registry
 from .context import ContextCompiler
 from .feedback import FeedbackEngine
+from .eventstore import EventStore
 from .loopguard import LoopGuard, failure_signature
 from .quota import ProviderSpec, QuotaManager
 
@@ -314,14 +315,121 @@ class TodoApp:
     MAX_ATTEMPTS = 3
     CONTEXT_TOKEN_BUDGET = 4000
 
-    def __init__(self, root: Optional[str] = None):
+    def __init__(self, root: Optional[str] = None, durable: bool = True):
         self.root = Path(root) if root else Path(__file__).resolve().parent.parent
         self.project_dir = self.root / "todo_slice"
         self._goal: Optional[models.Goal] = None
         self.bus = None
+        self.durable = durable
 
     def build(self) -> models.Goal:
         """Assemble the kernel and run the Todo slice end-to-end."""
+        from . import spec
+
+        # Assembling twice over the same workspace would duplicate history, so
+        # start from a clean durable log for a fresh build.
+        if self.durable:
+            store_path = self.project_dir / "events.jsonl"
+            if store_path.exists():
+                store_path.unlink()
+        self._assemble()
+
+        # Step 1: create -> analyze -> plan
+        self._goal = models.Goal(
+            project_id="todo",
+            user_intent="Build a production-ready Todo application",
+            title="Todo application",
+            project_type="terminal",
+        )
+        self.goalmode = goalmode.GoalMode(self.bus, self.omni, self.tg, self.og,
+                                          self.sb, self.checkpoint_mgr)
+        spec1 = spec.GoalSpec.from_text(
+            "todo", "Build a production-ready Todo application with add, complete, and delete.",
+            self._goal,
+        )
+        self.goalmode.create_goal("todo", "Build a production-ready Todo application",
+                                  "Todo application", spec1)
+        self.pm.transition(self._goal, models.GoalStatus.ANALYZING)
+        self.pm.transition(self._goal, models.GoalStatus.PLANNED)
+
+        # Decompose into tasks. Status stays PLANNED: GoalMode.execute is the
+        # only component that moves a goal into EXECUTING (auditable transition).
+        self._goal.task_graph = TodoPlanner.plan(self._goal, self.project_dir)
+
+        # Steps 2-6: the bounded autonomous loop.
+        return self._run_loop()
+
+    def recover(self) -> models.Goal:
+        """Resume an interrupted goal from its latest checkpoint (section 3.8).
+
+        Rebuilds the goal and task states from the checkpoint, rehydrates the
+        event history from the durable log, and re-enters the loop. Completed
+        tasks are skipped, so only unfinished work is redone.
+        """
+        self._assemble(hydrate=True)
+        record = self.checkpoint_mgr.latest(project_id="todo")
+        if record is None:
+            raise FileNotFoundError(
+                f"no checkpoint to recover from in {self.project_dir}")
+
+        self._goal = models.Goal.from_dict(record["goal_state"])
+        self._goal.task_graph = [
+            models.Task.from_dict(state)
+            for state in (record.get("task_state") or {}).values()
+        ]
+        self.goalmode = goalmode.GoalMode(self.bus, self.omni, self.tg, self.og,
+                                          self.sb, self.checkpoint_mgr)
+        self.goalmode.goal = self._goal
+
+        recovered = {
+            "checkpoint_id": record["checkpoint_id"],
+            "goal_status": self._goal.status.value,
+            "tasks_completed": sum(
+                1 for t in self._goal.task_graph
+                if t.status == models.TaskStatus.COMPLETED),
+            "tasks_total": len(self._goal.task_graph),
+            # Events restored from the durable log *before* recovery began, so
+            # the count is what history was recovered, not what was re-emitted.
+            "events_rehydrated": self._rehydrated,
+        }
+        self._goal.state["recovery"] = recovered
+        self._emit_recovery(recovered)
+
+        # A recovered goal may be mid-flight; the loop drives it to a fixed point.
+        if self._goal.status in (models.GoalStatus.COMPLETED,
+                                 models.GoalStatus.CANCELLED):
+            self._goal.state["loop_outcome"] = {
+                "attempts": 0, "succeeded": True, "recovered": True}
+            return self._goal
+        if self._goal.status in (models.GoalStatus.PLANNED,
+                                 models.GoalStatus.REPLANNING):
+            pass  # execute() will move it to EXECUTING
+        elif self._goal.status == models.GoalStatus.EXECUTING:
+            pass  # resume mid-execution
+        elif self._goal.status in (models.GoalStatus.BLOCKED,
+                                   models.GoalStatus.FAILED):
+            # Escalation stands; recovery must not silently clear it.
+            return self._goal
+        return self._run_loop()
+
+    def _emit_recovery(self, recovered: Dict[str, Any]) -> None:
+        if self.bus is not None:
+            self.bus.publish(
+                models.Event(
+                    event_type=models.EventType.CHECKPOINT_RESTORED,
+                    project_id=self._goal.project_id,
+                    goal_id=self._goal.goal_id,
+                    payload=recovered,
+                )
+            )
+
+    def _assemble(self, hydrate: bool = False) -> None:
+        """Construct the kernel components (shared by build and recover).
+
+        ``hydrate`` replays the durable log into the fresh bus before any new
+        event is published, so recovery starts from recorded history rather than
+        from an empty bus (section 3.8).
+        """
         from .events import EventBus
         from .state import GoalStateMachine
         from .taskgraph import TaskGraph
@@ -330,13 +438,16 @@ class TodoApp:
         from .registry import Registry
         from .observability import Observability
         from .omniroute import OmniRoute, RoutingPolicy
-        from .sandbox import Sandbox, SandboxConfig, NetworkMode
+        from .sandbox import Sandbox, SandboxConfig
         from .preview import PreviewEngine
         from .qa import QAEngine
         from .feedback import FeedbackEngine
-        from . import spec
 
-        self.bus = EventBus()
+        # Durable event log: makes replay and recovery real rather than cosmetic
+        # (section 12 event integrity / section 20).
+        self.store = EventStore(self.project_dir) if self.durable else None
+        self.bus = EventBus(store=self.store)
+        self._rehydrated = self.bus.hydrate() if (hydrate and self.store) else 0
         self.checkpoint_mgr = CheckpointManager(str(self.project_dir), self.bus)
         self.registry = Registry(str(self.project_dir), self.bus)
         self.sb = Sandbox(
@@ -380,31 +491,6 @@ class TodoApp:
         self.og.register(planner)
         self.og.register(coder)
 
-        # Step 1: create -> analyze -> plan
-        self._goal = models.Goal(
-            project_id="todo",
-            user_intent="Build a production-ready Todo application",
-            title="Todo application",
-            project_type="terminal",
-        )
-        self.goalmode = goalmode.GoalMode(self.bus, self.omni, self.tg, self.og,
-                                          self.sb, self.checkpoint_mgr)
-        spec1 = spec.GoalSpec.from_text(
-            "todo", "Build a production-ready Todo application with add, complete, and delete.",
-            self._goal,
-        )
-        self.goalmode.create_goal("todo", "Build a production-ready Todo application",
-                                  "Todo application", spec1)
-        self.pm.transition(self._goal, models.GoalStatus.ANALYZING)
-        self.pm.transition(self._goal, models.GoalStatus.PLANNED)
-
-        # Decompose into tasks. Status stays PLANNED: GoalMode.execute is the
-        # only component that moves a goal into EXECUTING (auditable transition).
-        self._goal.task_graph = TodoPlanner.plan(self._goal, self.project_dir)
-
-        # Steps 2-6: the bounded autonomous loop.
-        return self._run_loop()
-
     # ------------------------------------------------------------------
     # Execution loop: Build -> Preview -> QA -> Feedback -> Replan -> Verify
     # ------------------------------------------------------------------
@@ -430,6 +516,9 @@ class TodoApp:
             passed = self._verify(qa_evidence)
 
             if passed:
+                # Record the terminal state: a recovery point that does not exist
+                # cannot be recovered from (section 3.8).
+                self.goalmode.checkpoint(self._goal, self.project_dir)
                 self._record_outcome(qa_evidence)
                 return self._goal
 
@@ -446,6 +535,9 @@ class TodoApp:
                             "equivalent_failures": verdict.equivalent_failures,
                             "guard": self.guard.summary()},
                 )
+                # Checkpoint the escalation so recovery resumes a known state
+                # instead of silently clearing it.
+                self.goalmode.checkpoint(self._goal, self.project_dir)
                 return self._goal
 
             # Replan: failures -> clusters -> corrective tasks (section 18).
@@ -461,6 +553,7 @@ class TodoApp:
                     self._goal, oscillation,
                     detail={"guard": self.guard.summary()},
                 )
+                self.goalmode.checkpoint(self._goal, self.project_dir)
                 return self._goal
 
     def _failure_signature(self, evidence: List[models.Evidence]) -> str:

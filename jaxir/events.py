@@ -29,8 +29,11 @@ class EventBus:
 
     SCHEMA_VERSION = 1
 
-    def __init__(self, capacity: int = 100_000):
+    def __init__(self, capacity: int = 100_000, store: Any = None):
         self.capacity = capacity
+        #: Optional durable log. When present, every published event is appended
+        #: so the bus survives process death (section 12 event integrity).
+        self.store = store
         self._channels: Dict[str, deque] = {}
         self._subscribers: List[Callable[[models.Event], None]] = []
         self._history: List[models.Event] = []
@@ -51,6 +54,10 @@ class EventBus:
     def publish(self, event: models.Event) -> None:
         event.schema_version = self.SCHEMA_VERSION
         event.timestamp = datetime.now(timezone.utc)
+        if self.store is not None:
+            # Durable before it is observable: a crash must not lose an event
+            # that a subscriber already acted on.
+            self.store.append(event)
         self._history.append(event)
         if len(self._history) > self.capacity:
             self._history = self._history[-self.capacity:]
@@ -112,3 +119,26 @@ class EventBus:
     def reset(self) -> None:
         self._channels.clear()
         self._history.clear()
+
+    # ------------------------------------------------------------------
+    # Durable recovery
+    # ------------------------------------------------------------------
+
+    def hydrate(self, upto_seq: Optional[int] = None) -> int:
+        """Rebuild bus history from the durable store (crash recovery).
+
+        Events are loaded *without* re-appending: the log is the source of
+        truth, and rewriting it on recovery would duplicate history.
+        """
+        if self.store is None:
+            return 0
+        loaded = 0
+        for event in self.store.events(upto_seq=upto_seq):
+            event.schema_version = self.SCHEMA_VERSION
+            self._history.append(event)
+            chan = event.event_type.value
+            if chan not in self._channels:
+                self._channels[chan] = deque(maxlen=self.capacity)
+            self._channels[chan].append(event)
+            loaded += 1
+        return loaded

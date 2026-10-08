@@ -93,6 +93,21 @@ class Orchestrator:
         for t in goal.task_graph:
             if t.status == models.TaskStatus.COMPLETED:
                 continue
+            if t.status == models.TaskStatus.PENDING:
+                # Locked event (section 12): a task entering the graph is
+                # observable, and the log then knows the task exists - which is
+                # what makes state rebuild/replay complete rather than partial.
+                self.bus.publish(
+                    models.Event(
+                        event_type=models.EventType.TASK_CREATED,
+                        project_id=goal.project_id,
+                        goal_id=goal.goal_id,
+                        task_id=t.task_id,
+                        payload={"agent_type": t.agent_type,
+                                 "capabilities": t.capabilities,
+                                 "corrective": bool((t.inputs or {}).get("corrective"))},
+                    )
+                )
             agent = self.agent_for(t)
             if agent is None:
                 continue

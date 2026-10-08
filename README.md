@@ -27,11 +27,11 @@ Goal Engine (state.py, spec.py, goalmode.py)
     → Replanning / Verify
 ```
 
-Cross-cutting: Event Bus (`events.py`), Checkpoint Manager (`checkpoint.py`),
-Artifact Registry + Memory (`registry.py`), Observability (`observability.py`),
-Model Routing (`omniroute.py`), Quota Economy (`quota.py`), Context Compiler
-(`context.py`), Permission Broker (`sandbox.py`), Autonomous Loop Protection
-(`loopguard.py`).
+Cross-cutting: Event Bus + durable Event Store (`events.py`, `eventstore.py`),
+Checkpoint Manager (`checkpoint.py`), Artifact Registry + Memory (`registry.py`),
+Observability (`observability.py`), Model Routing (`omniroute.py`), Quota Economy
+(`quota.py`), Context Compiler (`context.py`), Permission Broker (`sandbox.py`),
+Autonomous Loop Protection (`loopguard.py`).
 
 ## The vertical slice
 
@@ -57,6 +57,15 @@ goal.state["replans"]             # corrective work per failed attempt
 goal.state["escalation"]          # present only when the loop gave up
 ```
 
+Interruption is survivable: events are appended to a durable hash-chained log, so
+a crashed run can be resumed.
+
+```python
+from jaxir.todoslice import TodoApp
+goal = TodoApp("/path/to/workspace").recover()   # resume from the latest checkpoint
+goal.state["recovery"]           # checkpoint id, tasks completed/total, events rehydrated
+```
+
 Completion (`_verify`) requires all evidence `PASS`, zero critical/high defects,
 and provenance on every item. A goal cannot be completed because an agent claimed
 success or because the build compiled.
@@ -72,4 +81,5 @@ python3 -m pytest -q
 - `tests/test_qa.py` — regression/security/performance suites, DoD integrity
 - `tests/test_loop.py` — loop guard, corrective tasks, replanning, recovery/escalation, auditability
 - `tests/test_phase3.py` — context compiler (≥50% reduction + retention), quota limits/health, capacity-aware routing
+- `tests/test_kernel_gate0.py` — event store integrity & tamper detection, 10× replay equivalence, checkpoint branch/replay, crash recovery
 

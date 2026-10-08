@@ -235,6 +235,9 @@ class Event(ModelBase):
     correlation_id: Optional[str] = None
     causation_id: Optional[str] = None
     payload: Dict[str, Any] = field(default_factory=dict)
+    #: Envelope version (section 12). Stamped by the EventBus on publish; 0 means
+    #: "never published", which is itself meaningful when reading a raw log.
+    schema_version: int = 0
 
     def to_dict(self) -> Dict[str, Any]:
         d = super().to_dict()

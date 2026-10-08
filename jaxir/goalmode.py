@@ -96,14 +96,14 @@ class GoalMode:
             self.state_m.transition(goal, models.GoalStatus.EXECUTING)
         self.orchestrator.assign(goal)
         # Commit an initial checkpoint before execution.
-        self._checkpoint(goal, project_dir)
+        self.checkpoint(goal, project_dir)
         for t in goal.task_graph:
             # Idempotent resume: completed work is never re-executed, so a
             # replanned goal runs only its new corrective work (section 7).
             if t.status == models.TaskStatus.COMPLETED:
                 continue
             self.orchestrator.run_task(t, goal)
-            self._checkpoint(goal, project_dir)
+            self.checkpoint(goal, project_dir)
         self.state_m.transition(goal, models.GoalStatus.VERIFYING)
         return goal
 
@@ -214,7 +214,8 @@ class GoalMode:
             retry_policy={"max_attempts": 1, "strategy": spec["strategy"]},
         )
 
-    def _checkpoint(self, goal: models.Goal, project_dir: Path) -> None:
+    def checkpoint(self, goal: models.Goal, project_dir: Path) -> None:
+        """Commit a checkpoint (public: callers record terminal states too)."""
         if self.cpk is None:
             return
         self.cpk.create(

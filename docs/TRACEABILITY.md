@@ -43,9 +43,9 @@ it. The table below is the current, honest state of that chain.
 | Feedback Engine | `jaxir/feedback.py` | IMPLEMENTED | Dedupe → cluster by root cause → prioritize by severity then size → one corrective task spec per root cause; feedback/specs are linked to the corrective task that addressed them. |
 | Replanning | `jaxir/goalmode.py` | IMPLEMENTED | `replan()` consumes failures, materialises corrective tasks into the task graph, records the attempt/strategy, and transitions REPLANNING → PLANNED. |
 | Autonomous Loop Protection | `jaxir/loopguard.py` | IMPLEMENTED | Bounded attempts, equivalent-failure limit (≤5, locked), oscillation and duplicate-task detection, strategy escalation ladder, escalation to BLOCKED with evidence preserved. |
-| Event Bus | `jaxir/events.py` | PARTIAL | Ordered, versioned envelopes, pub/sub, bounded history, replay, query. **In-memory only — Event Store persistence is NOT YET IMPLEMENTED.** |
+| Event Bus | `jaxir/events.py`, `jaxir/eventstore.py` | IMPLEMENTED | Ordered, versioned envelopes (schema_version is a real envelope field), pub/sub, bounded history, query, replay. `EventStore` gives durability: append-only JSONL with a SHA-256 hash chain, integrity verification that localises the first bad record, point-in-time replay, state rebuild, and bus hydration for crash recovery. |
 | Artifact Registry | `jaxir/registry.py` | PARTIAL | Artifacts with sha256 + provenance + goal linkage; decisions; memory indices with search. Artifact versioning is a static default (`0.0.0`). |
-| Checkpoint Manager | `jaxir/checkpoint.py` | PARTIAL | create / restore / list / compare. **branch and replay are NOT YET IMPLEMENTED.** |
+| Checkpoint Manager | `jaxir/checkpoint.py` | IMPLEMENTED | create / restore / list / compare / **branch** (with lineage, parent untouched) / **replay** (event-log reconstruction checked against what the checkpoint recorded). Checkpoints are anchored to an event `seq`, and terminal/escalated states are checkpointed so recovery has a real resume point. |
 | Observability | `jaxir/observability.py` | PARTIAL | Timer traces, decision summaries, resource snapshot. The `Goal → Task → Agent → Model → Tool → Command → File` span chain is **NOT YET IMPLEMENTED**. |
 | Memory | `jaxir/registry.py` | PARTIAL | Project/QA/agent/session indices are generic `MemoryIndex` objects. Per-level schema and Engineering Experience Memory are **NOT YET IMPLEMENTED**. |
 | Context Compiler | `jaxir/context.py` | PARTIAL | Real gather → dedupe → collapse-equivalent-failures → rank → select pipeline with a retention guarantee. Meets the ≥50% reduction target on a realistic corpus (measured 59.7%). The compiler supports decisions/memory/experience sources, but no caller supplies them yet — the slice feeds requirements, acceptance criteria, task definition, corrective root cause and project files. |
@@ -73,6 +73,8 @@ it. The table below is the current, honest state of that chain.
 | AT-GM-001 (autonomous slice completion) | IMPLEMENTED | `TodoApp._run_loop` completes the Todo goal against evidence. `tests/test_loop.py::TestExecutionLoop::test_healthy_goal_completes_on_first_attempt` |
 | AT-GM-002 (autonomous feedback correction) | PARTIAL | Fails → feedback → corrective task → replan → re-QA → complete, verified by `::test_goal_recovers_after_a_failed_attempt`. **The repair strategy itself is a stub** — see §7; the deterministic coder regenerates the artifact rather than changing code from the root cause. |
 | AT-GM-004 (autonomous-loop detection ≤5) | IMPLEMENTED | `LoopGuard` equivalence limit + attempt budget + oscillation. `::test_unrecoverable_goal_escalates_and_stops`, `TestLoopGuard::test_equivalent_failure_limit_triggers_escalation` |
+| 100% auditable state transitions | IMPLEMENTED | `GoalStateMachine` records every accepted transition in `goal.state["transitions"]`; the slice never assigns `goal.status` directly. `tests/test_loop.py::TestAuditableTransitions` |
+| 10× idempotent replay equivalence | IMPLEMENTED | `EventStore.replay_equivalent(runs=10)`. `tests/test_kernel_gate0.py::TestReplayEquivalence` — 10+ identically-folded rebuilds over a 250-event log. |
 | AT-GM-003 (24 h Goal Mode endurance) | NOT YET IMPLEMENTED | Requires a long-running harness. |
 | Context reduction ≥50% retaining required information | IMPLEMENTED | `jaxir/context.py`. `tests/test_phase3.py::TestContextCompilerReduction::test_meets_locked_reduction_target` — measured **59.7%** on a corpus with 40 equivalent failures + duplicated decisions + 30 files; retention proven by `::TestContextCompilerRetention`. |
 | Provider health / no quota bypass | IMPLEMENTED | `tests/test_phase3.py::TestQuotaLimitsNeverBypassed` — a rate/token/exhausted provider raises instead of exceeding. |
@@ -110,7 +112,7 @@ and §49.13.
 
 | Gate | Status | Blocking gaps |
 |---|---|---|
-| Gate 0 — Kernel Integrity | PARTIAL | Event/integrity/state/idempotency yes; **Event Store persistence** and checkpoint branch/replay outstanding. |
+| Gate 0 — Kernel Integrity | **IMPLEMENTED** | Event integrity: durable append-only hash-chained log, tamper/truncation/reorder detection (`tests/test_kernel_gate0.py`). State transitions: audited on the goal, 100% through the state machine. Idempotency: 10× replay equivalence (`EventStore.replay_equivalent`). Recovery: an interrupted run resumes from its checkpoint with 0 tasks re-executed and history rehydrated from the log. Checkpoint foundations: create/restore/compare/branch/replay. |
 | Gate 1 — Autonomous Execution | PARTIAL | Goal → Plan → Task → Agent → Execution works end-to-end. The runtime is a deterministic in-process coder, **not the Codex Runtime**; recovery mid-run is not implemented. |
 | Gate 2 — Engineering Quality | PARTIAL | Preview, QA, evidence, feedback and replanning exist. Feedback → corrective tasks → replanning loop is **NOT YET IMPLEMENTED**. |
 | Gate 3 — Production Readiness | NOT YET IMPLEMENTED | Requires all P0 and ≥95% P1 requirements plus an automated evidence package. |
@@ -153,12 +155,13 @@ Currently `COMPLETED` implies six evidence items: `qa.preview`,
 
 ```bash
 cd .cline/data/workspaces/chat/jaxir-os
-python3 -m pytest -q          # 178 tests
+python3 -m pytest -q          # 223 tests
 ```
 
 | Test file | Covers |
 |---|---|
 | `tests/test_kernel.py` | contracts, state machine, task graph, checkpoint, vertical slice, preview |
+| `tests/test_kernel_gate0.py` | event store integrity/tamper detection, 10× replay equivalence, checkpoint branch/replay, crash recovery |
 | `tests/test_sandbox.py` | filesystem confinement, secrets, rlimits, network mode, permissions, orchestrator integration |
 | `tests/test_qa.py` | regression/security/performance suites, suite-coverage disclosure, Definition-of-Done integrity |
 | `tests/test_loop.py` | failure equivalence, loop guard, corrective tasks, replanning, execution-loop recovery/escalation, transition auditability |
