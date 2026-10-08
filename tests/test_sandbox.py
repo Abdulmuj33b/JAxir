@@ -58,14 +58,26 @@ class TestFilesystemConfinement:
             sb.resolve(target)
 
     def test_symlink_escape_rejected(self, tmp_path):
+        """A symlink pointing outside the sandbox must not be a way out.
+
+        No platform guard: the sandbox's symlink defence is POSIX-relevant
+        (the sandbox uses rlimits), so an environment where this cannot even be
+        set up should fail loudly rather than silently skip the check.
+        """
         sb, _, workdir = make_sandbox(tmp_path)
         link = workdir / "sneaky"
-        try:
-            link.symlink_to("/etc")
-        except OSError:
-            pytest.skip("symlinks unavailable")
+        link.symlink_to("/etc")
+        # Prove the escape vector was actually created.
+        assert link.is_symlink()
+        assert (link / "passwd").exists()  # the symlink really does resolve
         with pytest.raises(FilesystemViolation):
             sb.resolve(link / "passwd")
+        # ...and the same via a relative symlink out of the workdir.
+        relative = workdir / "up"
+        relative.symlink_to("../../")
+        assert relative.is_symlink()
+        with pytest.raises(FilesystemViolation):
+            sb.resolve(relative / "etc" / "passwd")
 
     def test_read_missing_file_rejected(self, tmp_path):
         sb, _, workdir = make_sandbox(tmp_path)
