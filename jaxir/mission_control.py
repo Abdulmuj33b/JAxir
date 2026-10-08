@@ -65,12 +65,7 @@ class MissionSnapshot:
 
 
 class MissionControl:
-    """Operational summary for Goal Mode and execution loops.
-
-    This is intentionally lightweight and does not duplicate the state machine.
-    It reads the goal/task/evidence state already managed by the kernel and
-    displays a concise operational dashboard for operators.
-    """
+    """Operational summary for Goal Mode and execution loops."""
 
     def __init__(self, goal: Optional[Any] = None, tasks: Optional[Iterable[Any]] = None,
                  evidence: Optional[Iterable[Any]] = None):

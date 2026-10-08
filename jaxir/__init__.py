@@ -20,6 +20,7 @@ __all__ = [
     "checkpoint",
     "mission_control",
     "traceability",
+    "cli",
     # kernel
     "state",
     "taskgraph",
