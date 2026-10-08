@@ -200,3 +200,86 @@ class TestTodoVerticalSlice:
         goal = app.build()
         evs = app.registry.list_artifacts(goal.goal_id)
         assert len(evs) > 0
+
+    def test_preview_is_verified_not_just_built(self, app):
+        """AT-PREV-001: preview evidence must be served-response based."""
+        goal = app.build()
+        by_id = {v["id"]: v["status"] for v in goal.verification_requirements}
+        assert by_id.get("qa.preview") == "PASS"
+        assert by_id.get("qa.todo.functional") == "PASS"
+
+    def test_preview_server_is_released_after_build(self, app):
+        """Resource cleanup: the preview server must not outlive the build."""
+        app.build()
+        assert app.prv.status("web").running is False
+
+
+class TestWebPreviewAdapter:
+    """The web adapter must really serve the artifact over loopback."""
+
+    @pytest.fixture()
+    def served(self, tmp_path):
+        from jaxir.preview import PreviewEngine
+        from jaxir.sandbox import Sandbox, SandboxConfig
+
+        workdir = tmp_path / "site"
+        workdir.mkdir()
+        (workdir / "index.html").write_text(
+            "<!doctype html><html><head><title>JaXir Todo</title></head>"
+            "<body><form id='new-form'><input type='text'><button>Add</button>"
+            "</form><ul id='list'></ul></body></html>",
+            encoding="utf-8",
+        )
+        sandbox = Sandbox(SandboxConfig(project_root=str(tmp_path),
+                                        workdir=str(workdir)),
+                          events.EventBus())
+        engine = PreviewEngine(sandbox, events.EventBus())
+        status = engine.start("web", 0, "g1", "p1", {"workdir": str(workdir)})
+        yield engine, status
+        engine.stop("web")
+
+    def test_serves_the_artifact_over_http(self, served):
+        import urllib.request
+        engine, status = served
+        assert status.running, status.error
+        with urllib.request.urlopen(status.url + "/index.html", timeout=5) as r:
+            assert r.getcode() == 200
+            assert "JaXir Todo" in r.read().decode("utf-8")
+
+    def test_capture_records_served_dom(self, served):
+        engine, status = served
+        cap = engine.capture("web")
+        assert cap["http_status"] == 200
+        dom = cap["dom_snapshot"]
+        assert dom["title"] == "JaXir Todo"
+        assert "new-form" in dom["ids"] and "list" in dom["ids"]
+        assert dom["interactive"] is True
+
+    def test_inspect_is_stdlib_only(self, served):
+        engine, _ = served
+        dom = engine.inspect("web")
+        assert dom["title"] == "JaXir Todo"
+        assert "form" in dom["tags_found"]
+
+    def test_stop_releases_the_port(self, served):
+        engine, status = served
+        engine.stop("web")
+        assert engine.status("web").running is False
+        import urllib.error
+        import urllib.request
+        with pytest.raises(urllib.error.URLError):
+            urllib.request.urlopen(status.url + "/index.html", timeout=2)
+
+    def test_failed_preview_emits_preview_failed(self, tmp_path):
+        from jaxir.preview import PreviewEngine
+        from jaxir.sandbox import Sandbox, SandboxConfig
+
+        bus = events.EventBus()
+        sandbox = Sandbox(SandboxConfig(project_root=str(tmp_path),
+                                        workdir=str(tmp_path / "missing")),
+                          bus)
+        engine = PreviewEngine(sandbox, bus)
+        # An impossible port makes start() fail; that must be observable.
+        status = engine.start("web", -1, "g1", "p1", {})
+        assert status.running is False
+        assert bus.count(models.EventType.PREVIEW_FAILED) == 1

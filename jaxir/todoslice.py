@@ -379,11 +379,12 @@ class TodoApp:
         # Step 2: execute task graph via orchestrator (planner + coder)
         self.goalmode.execute(self._goal, self.project_dir)
 
-        # Step 3: preview (web adapter) - also generates the web app artifact
-        self._preview()
+        # Step 3: preview (web adapter) - generates the web app artifact and
+        # verifies it is really served (AT-PREV-001).
+        preview_evidence = self._preview()
 
         # Step 4: QA - functional tests -> evidence
-        qa_evidence = self._qa()
+        qa_evidence = self._qa(preview_evidence)
 
         # Step 5: feedback - evidence-backed, feeds replanning
         self._feedback(qa_evidence)
@@ -412,29 +413,81 @@ class TodoApp:
                               linked_goal_id=self._goal.goal_id)
         )
 
-    def _preview(self) -> None:
-        """Preview the todo app (web adapter)."""
+    def _preview(self) -> models.Evidence:
+        """Preview the todo app (web adapter) and verify it is really served.
+
+        AT-PREV-001: the preview must come up and serve the built app. The
+        served HTTP response - not the file on disk - is the evidence, so a
+        preview that silently fails to start cannot pass verification.
+        """
         self._generate_web_app()
+        # Ephemeral port: never collide with a real service during tests.
         status = self.prv.start(
-            "web", 8137, self._goal.goal_id, self._goal.project_id,
+            "web", 0, self._goal.goal_id, self._goal.project_id,
             {"workdir": str(self.project_dir)},
         )
+        capture = self.prv.capture("web") if status.running else {}
+        evidence = self._preview_evidence(status, capture)
+
         for t in self._goal.task_graph:
             if t.status == models.TaskStatus.COMPLETED and t.result:
                 t.result = {**t.result, "preview": status.to_dict()}
-        self.prv.capture("web")
         if self.bus is not None:
             self.bus.publish(
                 models.Event(
                     event_type=models.EventType.PREVIEW_UPDATED,
                     project_id=self._goal.project_id,
                     goal_id=self._goal.goal_id,
-                    payload={"preview_type": "web", "url": status.url},
+                    payload={"preview_type": "web", "url": status.url,
+                             "http_status": capture.get("http_status")},
                 )
             )
+        # Resource cleanup: the preview server must not outlive the build.
+        self.prv.stop("web")
+        return evidence
 
-    def _qa(self) -> List[models.Evidence]:
-        """Functional + regression + security + performance evidence."""
+    def _preview_evidence(self, status: Any, capture: Dict[str, Any]) -> models.Evidence:
+        """Evidence that the preview served the app (AT-PREV-001)."""
+        dom = capture.get("dom_snapshot") or {}
+        ids = dom.get("ids") or []
+        checks = {
+            "preview_running": bool(status.running),
+            "http_200": capture.get("http_status") == 200,
+            "served_title": dom.get("title") == "JaXir Todo",
+            "add_form_present": "new-form" in ids,
+            "list_present": "list" in ids,
+            "interactive": bool(dom.get("interactive")),
+        }
+        passed = all(checks.values())
+        evid = models.Evidence(test_id="qa.preview", goal_id=self._goal.goal_id,
+                               project_id=self._goal.project_id)
+        evid.status = (models.EvidenceStatus.PASS if passed
+                       else models.EvidenceStatus.FAIL)
+        evid.expected = {"preview_running": True, "http_status": 200,
+                         "title": "JaXir Todo",
+                         "required_ids": ["new-form", "list"]}
+        evid.actual = {"preview": status.to_dict(), "capture": capture,
+                       "checks": checks}
+        evid.artifacts = [str(self.project_dir / "index.html")]
+        evid.provenance = {"test_id": "qa.preview",
+                           "method": "http_serve_and_dom_inspect",
+                           "url": status.url,
+                           "project_dir": str(self.project_dir)}
+        if self.bus is not None:
+            self.bus.publish(
+                models.Event(
+                    event_type=(models.EventType.TEST_PASSED if passed
+                                else models.EventType.TEST_FAILED),
+                    project_id=self._goal.project_id,
+                    goal_id=self._goal.goal_id,
+                    payload={"test_id": evid.test_id, "ok": passed,
+                             "checks": checks},
+                )
+            )
+        return evid
+
+    def _qa(self, preview_evidence: models.Evidence) -> List[models.Evidence]:
+        """Preview + functional + regression + security + performance evidence."""
         ev = self.qae.test_todo(str(self.project_dir), expected_todos=1,
                                 expected_completed=1)
         ev.goal_id = self._goal.goal_id
@@ -445,7 +498,8 @@ class TodoApp:
         for e in (reg, sec, perf):
             e.goal_id = self._goal.goal_id
             e.project_id = self._goal.project_id
-        verdict = self.qae.verdict([ev, reg, sec, perf])
+        items = [preview_evidence, ev, reg, sec, perf]
+        verdict = self.qae.verdict(items)
         verdict.goal_id = self._goal.goal_id
         verdict.project_id = self._goal.project_id
         if self.bus is not None:
@@ -457,11 +511,11 @@ class TodoApp:
                     project_id=self._goal.project_id,
                     goal_id=self._goal.goal_id,
                     payload={"verdict": verdict.test_id, "ok": passed,
-                             "evidence": [e.test_id for e in (ev, reg, sec, perf)],
+                             "evidence": [e.test_id for e in items],
                              "checks": (ev.actual or {}).get("checks", [])},
                 )
             )
-        return [ev, reg, sec, perf, verdict]
+        return items + [verdict]
 
     def _feedback(self, evidence: List[models.Evidence]) -> None:
         """Feedback from failures -> deduplication -> clustering -> root cause."""
