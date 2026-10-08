@@ -29,18 +29,31 @@ Goal Engine (state.py, spec.py, goalmode.py)
 
 Cross-cutting: Event Bus (`events.py`), Checkpoint Manager (`checkpoint.py`),
 Artifact Registry + Memory (`registry.py`), Observability (`observability.py`),
-Model Routing (`omniroute.py`), Permission Broker (`sandbox.py`).
+Model Routing (`omniroute.py`), Permission Broker (`sandbox.py`),
+Autonomous Loop Protection (`loopguard.py`).
 
 ## The vertical slice
 
 `jaxir/todoslice.py` (`TodoApp`) drives a goal through the full lifecycle and
-completes it only against evidence:
+completes it only against evidence. The loop is bounded, so an unrecoverable goal
+escalates instead of spinning:
+
+```
+Build -> Preview -> QA -> Verify
+  pass -> COMPLETED
+  fail -> Feedback -> Replan (corrective tasks) -> retry,
+          bounded by attempt budget, a <=5 equivalent-failure limit,
+          and oscillation detection -> BLOCKED (escalated, evidence kept)
+```
 
 ```python
 from jaxir.todoslice import TodoApp
 goal = TodoApp("/path/to/workspace").build()
 goal.status                       # COMPLETED only if every evidence item passes
 goal.verification_requirements    # per-criterion PASS/FAIL
+goal.state["transitions"]         # audited state path
+goal.state["replans"]             # corrective work per failed attempt
+goal.state["escalation"]          # present only when the loop gave up
 ```
 
 Completion (`_verify`) requires all evidence `PASS`, zero critical/high defects,
@@ -56,4 +69,5 @@ python3 -m pytest -q
 - `tests/test_kernel.py` — contracts, state machine, task graph, checkpoint, slice
 - `tests/test_sandbox.py` — filesystem confinement, secrets, rlimits, network mode, permissions
 - `tests/test_qa.py` — regression/security/performance suites, DoD integrity
+- `tests/test_loop.py` — loop guard, corrective tasks, replanning, recovery/escalation, auditability
 

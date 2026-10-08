@@ -15,6 +15,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from . import models, goalmode, orchestrator, sandbox, preview, qa, checkpoint, registry
+from .feedback import FeedbackEngine
+from .loopguard import LoopGuard, failure_signature
 
 
 class TodoPlanner:
@@ -299,7 +301,12 @@ class TodoApp:
 
     First vertical slice: a Todo application (CLI + web app) executed through
     the complete JaXir kernel lifecycle with evidence-backed completion.
+
+    ``MAX_ATTEMPTS`` bounds the Build -> QA -> Feedback -> Replan loop so an
+    unrecoverable goal escalates instead of retrying forever (section 42).
     """
+
+    MAX_ATTEMPTS = 3
 
     def __init__(self, root: Optional[str] = None):
         self.root = Path(root) if root else Path(__file__).resolve().parent.parent
@@ -338,6 +345,8 @@ class TodoApp:
         self.prv = PreviewEngine(self.sb, self.bus)
         self.qae = QAEngine(self.bus, self.registry, None)
         self.fb = FeedbackEngine(self.bus)
+        self.guard = LoopGuard(max_attempts=self.MAX_ATTEMPTS)
+        self.attempt = 0
 
         # Register replaceable agents (planner + coder).
         planner = orchestrator.AgentModel(
@@ -348,7 +357,8 @@ class TodoApp:
         )
         coder = orchestrator.AgentModel(
             agent_id="coder", agent_type="coder", identity="JaXir Coder",
-            capabilities=["coding", "build", "sandbox_exec"], tools=["write", "run"],
+            capabilities=["coding", "build", "sandbox_exec", "corrective"],
+            tools=["write", "run"],
             environment={"project_type": "todo"},
         )
         self.og.register(planner)
@@ -372,27 +382,110 @@ class TodoApp:
         self.pm.transition(self._goal, models.GoalStatus.ANALYZING)
         self.pm.transition(self._goal, models.GoalStatus.PLANNED)
 
-        # Decompose into tasks.
+        # Decompose into tasks. Status stays PLANNED: GoalMode.execute is the
+        # only component that moves a goal into EXECUTING (auditable transition).
         self._goal.task_graph = TodoPlanner.plan(self._goal, self.project_dir)
-        self._goal.status = models.GoalStatus.EXECUTING
 
-        # Step 2: execute task graph via orchestrator (planner + coder)
-        self.goalmode.execute(self._goal, self.project_dir)
+        # Steps 2-6: the bounded autonomous loop.
+        return self._run_loop()
 
-        # Step 3: preview (web adapter) - generates the web app artifact and
-        # verifies it is really served (AT-PREV-001).
-        preview_evidence = self._preview()
+    # ------------------------------------------------------------------
+    # Execution loop: Build -> Preview -> QA -> Feedback -> Replan -> Verify
+    # ------------------------------------------------------------------
 
-        # Step 4: QA - functional tests -> evidence
-        qa_evidence = self._qa(preview_evidence)
+    def _run_loop(self) -> models.Goal:
+        """Drive Build -> Preview -> QA -> Feedback -> Replan until done.
 
-        # Step 5: feedback - evidence-backed, feeds replanning
-        self._feedback(qa_evidence)
+        Bounded three ways so it can never spin: an attempt budget, an
+        equivalent-failure limit (locked: detect within <=5), and oscillation
+        detection on the revised plan. On exhaustion the goal escalates to
+        BLOCKED with all evidence preserved (sections 41/42).
+        """
+        while True:
+            self.attempt = self.guard.begin_attempt()
 
-        # Step 6: verify (Definition of Done)
-        self._verify(qa_evidence)
+            # Build/execute the current task graph (only un-completed tasks run).
+            self.goalmode.execute(self._goal, self.project_dir)
 
-        return self._goal
+            # Preview, QA, then verify against the Definition of Done.
+            preview_evidence = self._preview()
+            qa_evidence = self._qa(preview_evidence)
+            self._feedback(qa_evidence, attempt=self.attempt)
+            passed = self._verify(qa_evidence)
+
+            if passed:
+                self._record_outcome(qa_evidence)
+                return self._goal
+
+            # Failed: feed the failure back and decide whether to continue.
+            signature = self._failure_signature(qa_evidence)
+            verdict = self.guard.record_failure(signature)
+            self._goal.state.setdefault("loop", []).append(verdict.to_dict())
+            self.fb_publish_verdict(verdict)
+
+            if not verdict.should_continue:
+                self.goalmode.block(
+                    self._goal, verdict.reason,
+                    detail={"attempts": self.attempt, "strategy": verdict.strategy,
+                            "equivalent_failures": verdict.equivalent_failures,
+                            "guard": self.guard.summary()},
+                )
+                return self._goal
+
+            # Replan: failures -> clusters -> corrective tasks (section 18).
+            failures = self._failed_feedback(qa_evidence)
+            self.goalmode.replan(self._goal, self.fb, failures, self.project_dir,
+                                 strategy=verdict.strategy, attempt=self.attempt)
+
+            plan_sig = LoopGuard.plan_signature(self._goal.task_graph)
+            self.guard.record_plan(plan_sig)
+            oscillation = self.guard.detect_oscillation()
+            if oscillation:
+                self.goalmode.block(
+                    self._goal, oscillation,
+                    detail={"guard": self.guard.summary()},
+                )
+                return self._goal
+
+    def _failure_signature(self, evidence: List[models.Evidence]) -> str:
+        """Fingerprint of *causal* failures (derived aggregates excluded).
+
+        qa.verdict is a roll-up of the criteria it aggregates, so including it
+        would make two identical root-cause sets hash differently.
+        """
+        failed = [e.test_id for e in evidence
+                  if e.status != models.EvidenceStatus.PASS
+                  and e.test_id not in self.qae.AGGREGATE_SUITES]
+        return failure_signature("qa.failure", failed)
+
+    def _failed_feedback(self, evidence: List[models.Evidence]) -> List[Any]:
+        """This attempt's feedback records for its failing criteria."""
+        failed = {e.test_id for e in evidence
+                  if e.status != models.EvidenceStatus.PASS}
+        return [f for f in self.fb.feedback
+                if f.failure_event in failed and f.attempt == self.attempt]
+
+    def fb_publish_verdict(self, verdict: Any) -> None:
+        """Make the loop decision observable (section 42)."""
+        if self.bus is not None:
+            self.bus.publish(
+                models.Event(
+                    event_type=(models.EventType.GOAL_PAUSED
+                                if verdict.action == "escalate"
+                                else models.EventType.FEEDBACK_ACCEPTED),
+                    project_id=self._goal.project_id,
+                    goal_id=self._goal.goal_id,
+                    payload={"loop_guard": verdict.to_dict()},
+                )
+            )
+
+    def _record_outcome(self, evidence: List[models.Evidence]) -> None:
+        self._goal.state["loop_outcome"] = {
+            "attempts": self.attempt,
+            "succeeded": True,
+            "guard": self.guard.summary(),
+        }
+
 
     def _generate_web_app(self) -> None:
         """Generate the web app into the sandbox workdir for preview."""
@@ -517,23 +610,62 @@ class TodoApp:
             )
         return items + [verdict]
 
-    def _feedback(self, evidence: List[models.Evidence]) -> None:
-        """Feedback from failures -> deduplication -> clustering -> root cause."""
-        failed = [e for e in evidence if e.status == models.EvidenceStatus.FAIL]
+    def _feedback(self, evidence: List[models.Evidence], attempt: int = 1) -> None:
+        """Failures -> dedupe -> cluster -> root cause (section 18).
+
+        Severity comes from the QA defect that was actually raised, so the
+        prioritisation of corrective work is evidence-derived, not guessed.
+        """
+        # Aggregate suites (e.g. qa.verdict) reroll the same failure, so acting
+        # on them would raise a duplicate corrective task for one root cause.
+        failed = [e for e in evidence
+                  if e.status != models.EvidenceStatus.PASS
+                  and e.test_id not in self.qae.AGGREGATE_SUITES]
         if not failed:
+            self._goal.state["feedback_clusters"] = []
             return
         for e in failed:
-            self.fb.create(self._goal.project_id, self._goal.goal_id, None,
-                           e.test_id, ["todo_app_failure"], root_cause="todo app bug")
-        deduped = self.fb.dedupe(self.fb.feedback)
-        self._goal.state["feedback_clusters"] = self.fb.get_clusters(deduped)
+            self.fb.create(
+                self._goal.project_id, self._goal.goal_id, None,
+                failure_event=e.test_id,
+                symptoms=[f"{e.test_id}:{e.status.value}"],
+                root_cause=self._root_cause_for(e),
+                severity=self._severity_for(e),
+                attempt=attempt,
+            )
+        # Many symptoms, fewer root causes: cluster before generating work.
+        self._goal.state["feedback_clusters"] = self.fb.prioritized_clusters(
+            self.fb.dedupe(self.fb.feedback)
+        )
 
-    def _verify(self, evidence: List[models.Evidence]) -> None:
-        """Verify Definition of Done; completing evidence-backed.
+    def _severity_for(self, evidence: models.Evidence) -> str:
+        """Severity of the defect recorded for this evidence item."""
+        for d in self.qae.defects:
+            if d.test_id == evidence.test_id:
+                return d.severity
+        return "high"  # a failing acceptance criterion is never low
+
+    def _root_cause_for(self, evidence: models.Evidence) -> str:
+        """Best available root-cause label for a failing criterion."""
+        actual = evidence.actual or {}
+        failures = actual.get("failures") or []
+        if failures:
+            return f"{evidence.test_id}:{failures[0].get('name', 'regression')}"
+        if evidence.test_id == "qa.preview":
+            checks = actual.get("checks") or {}
+            broken = [k for k, ok in checks.items() if not ok]
+            return f"qa.preview:{broken[0] if broken else 'unknown'}"
+        return f"{evidence.test_id}:failed"
+
+    def _verify(self, evidence: List[models.Evidence]) -> bool:
+        """Verify the Definition of Done; returns whether the goal may complete.
 
         Constitution section 19: every item must PASS, critical defects must be
         zero, and every item must carry provenance. Agent claims, a successful
         build, or passing compilation are never sufficient.
+
+        Status moves only through the state machine, so every transition is
+        validated and audited: VERIFYING -> PASSED -> COMPLETED, or -> FAILED.
         """
         all_pass = all(e.status == models.EvidenceStatus.PASS for e in evidence)
         blocking_defects = [d for d in self.qae.defects
@@ -547,26 +679,25 @@ class TodoApp:
             "all_evidence_passed": all_pass,
             "critical_defects": len(blocking_defects),
             "provenance_missing": missing_provenance,
+            "attempt": self.attempt,
         }
-        self._goal.state["definition_of_done"] = dod
         passed = all_pass and not blocking_defects and not missing_provenance
-
         if passed:
-            self._goal.status = models.GoalStatus.COMPLETED
+            dod["definition_of_done"] = "satisfied"
+            self._goal.state["definition_of_done"] = dod
+            self.pm.transition(self._goal, models.GoalStatus.PASSED)
+            self.pm.transition(self._goal, models.GoalStatus.COMPLETED)
             if self.bus is not None:
                 self.bus.publish(
                     models.Event(event_type=models.EventType.GOAL_COMPLETED,
                                  project_id=self._goal.project_id,
                                  goal_id=self._goal.goal_id,
-                                 payload={"dod": "all_evidence_passed",
-                                          **dod}))
+                                 payload=dod))
         else:
-            self._goal.status = models.GoalStatus.FAILED
-            if self.bus is not None:
-                self.bus.publish(
-                    models.Event(event_type=models.EventType.GOAL_FAILED,
-                                 project_id=self._goal.project_id,
-                                 goal_id=self._goal.goal_id,
-                                 payload={"dod": "evidence_failed", **dod,
-                                          "failed": [e.test_id for e in evidence
-                                                     if e.status != models.EvidenceStatus.PASS]}))
+            dod["definition_of_done"] = "unsatisfied"
+            dod["failed"] = [e.test_id for e in evidence
+                             if e.status != models.EvidenceStatus.PASS]
+            self._goal.state.setdefault("dod_history", []).append(dod)
+            self._goal.state["definition_of_done"] = dod
+            self.pm.transition(self._goal, models.GoalStatus.FAILED)
+        return passed

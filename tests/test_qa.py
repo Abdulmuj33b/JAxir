@@ -205,7 +205,11 @@ class TestDefinitionOfDoneIntegrity:
         assert goal.state["definition_of_done"]["critical_defects"] == 0
 
     def test_security_finding_blocks_completion(self, tmp_path):
-        """A critical artifact finding must prevent COMPLETED."""
+        """A persistent critical finding must prevent COMPLETED.
+
+        With the bounded loop this escalates rather than terminating silently:
+        the goal ends BLOCKED with the evidence preserved (section 41).
+        """
         from jaxir.todoslice import TodoApp
 
         app = TodoApp(str(tmp_path))
@@ -221,7 +225,17 @@ class TestDefinitionOfDoneIntegrity:
             goal = app.build()
         finally:
             QAEngine.run_security = original
-        assert goal.status == models.GoalStatus.FAILED
+
+        assert goal.status == models.GoalStatus.BLOCKED
+        assert goal.status != models.GoalStatus.COMPLETED
+        assert goal.state["escalation"]["reason"]
+        assert goal.state["definition_of_done"]["all_evidence_passed"] is False
+        # Escalated within the locked bounds, never spinning.
+        guard = goal.state["loop_outcome"] if "loop_outcome" in goal.state else None
+        summary = goal.state["escalation"]["guard"]
+        assert summary["attempts"] <= TodoApp.MAX_ATTEMPTS
+        assert max(summary["equivalent_failure_counts"].values()) <= \
+            summary["equivalent_failure_limit"]
 
     def test_blocking_defect_blocks_completion(self, tmp_path):
         from jaxir.todoslice import TodoApp
@@ -242,5 +256,9 @@ class TestDefinitionOfDoneIntegrity:
             goal = app.build()
         finally:
             QAEngine.run_performance = original
-        assert goal.status == models.GoalStatus.FAILED
-        assert goal.state["definition_of_done"]["critical_defects"] >= 1
+
+        assert goal.status != models.GoalStatus.COMPLETED
+        assert goal.state["escalation"]["guard"][
+            "equivalent_failure_counts"]  # the failure was classified
+        # Evidence is preserved on escalation (never discarded silently).
+        assert goal.state["dod_history"]

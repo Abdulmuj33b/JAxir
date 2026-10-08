@@ -33,15 +33,16 @@ it. The table below is the current, honest state of that chain.
 
 | Subsystem | Module | Status | Notes |
 |---|---|---|---|
-| Goal Engine | `jaxir/state.py`, `jaxir/spec.py`, `jaxir/goalmode.py` | PARTIAL | Locked 13 goal states + invalid-transition rejection + idempotent no-op. `GoalSpec.from_text` is a deterministic heuristic placeholder, not a real NL analyser. |
+| Goal Engine | `jaxir/state.py`, `jaxir/spec.py`, `jaxir/goalmode.py` | PARTIAL | Locked 13 goal states, invalid-transition rejection, idempotent no-op, and a per-goal transition audit log (every accepted transition recorded, so 100% auditable is testable). `COMPLETED` is reachable via `PASSED`. `GoalSpec.from_text` is a deterministic heuristic placeholder, not a real NL analyser. |
 | Task Graph | `jaxir/taskgraph.py` | PARTIAL | Kahn topological order, cycle rejection, environment/resource conflict detection. File conflicts and duplicate non-idempotent execution are **NOT YET IMPLEMENTED**. |
 | Agent Orchestrator | `jaxir/orchestrator.py` | PARTIAL | Agent registry, capability-intersection routing, task execution + evidence slots. Does not yet assign model/provider/permissions/resource limits per task. |
 | Model Runtime | `jaxir/omniroute.py` | PARTIAL | Deterministic routing policy + `model.requested` events. No Model Runtime abstraction, **no Codex adapter**, no quota manager. |
 | Execution Sandbox | `jaxir/sandbox.py` | PARTIAL | Real filesystem confinement, rlimits, network policy, secret scrubbing, permission broker, cleanup + orphan detection. See §4 below for what remains. |
 | Preview / Simulation | `jaxir/preview.py` | PARTIAL | Real web (HTTP-served + DOM-inspected) and terminal adapters + full `start/stop/reload/inspect/capture/status` interface. mobile/desktop/game/video/3D/embedded/hardware/API adapters are labelled `None` placeholders. |
 | QA / QC | `jaxir/qa.py` | PARTIAL | Real functional, regression, security (static audit) and performance (measured latency) evidence. Visual/accessibility/chaos/adversarial/synthetic-user/hardware QA are **NOT YET IMPLEMENTED**. |
-| Feedback Engine | `jaxir/feedback.py` | PARTIAL | Real dedupe → cluster → root-cause → prioritize, invoked from the slice. Corrective-task generation is **NOT YET IMPLEMENTED** — failures are recorded and clustered but do not yet create tasks that re-enter the graph. |
-| Replanning | `jaxir/goalmode.py` | STUB | `replan()` moves state and emits an event; it does not consume feedback to produce a revised plan. |
+| Feedback Engine | `jaxir/feedback.py` | IMPLEMENTED | Dedupe → cluster by root cause → prioritize by severity then size → one corrective task spec per root cause; feedback/specs are linked to the corrective task that addressed them. |
+| Replanning | `jaxir/goalmode.py` | IMPLEMENTED | `replan()` consumes failures, materialises corrective tasks into the task graph, records the attempt/strategy, and transitions REPLANNING → PLANNED. |
+| Autonomous Loop Protection | `jaxir/loopguard.py` | IMPLEMENTED | Bounded attempts, equivalent-failure limit (≤5, locked), oscillation and duplicate-task detection, strategy escalation ladder, escalation to BLOCKED with evidence preserved. |
 | Event Bus | `jaxir/events.py` | PARTIAL | Ordered, versioned envelopes, pub/sub, bounded history, replay, query. **In-memory only — Event Store persistence is NOT YET IMPLEMENTED.** |
 | Artifact Registry | `jaxir/registry.py` | PARTIAL | Artifacts with sha256 + provenance + goal linkage; decisions; memory indices with search. Artifact versioning is a static default (`0.0.0`). |
 | Checkpoint Manager | `jaxir/checkpoint.py` | PARTIAL | create / restore / list / compare. **branch and replay are NOT YET IMPLEMENTED.** |
@@ -69,7 +70,16 @@ it. The table below is the current, honest state of that chain.
 | AT-QA-002 (regression) | PARTIAL | `qa.QAEngine.run_regression` — real golden-contract replay of the artifact under test. Not a cross-version regression suite. |
 | AT-QA-003 (security / performance) | PARTIAL | `qa.QAEngine.run_security` (static audit, real rules) and `run_performance` (measured latency percentiles). Neither is a substitute for a full SAST/profiling toolchain. |
 | AT-SEC-001 | PARTIAL | Sandbox isolation tests: `tests/test_sandbox.py`. Kernel-level (namespace) isolation is not claimed — see §4. |
-| AT-001…AT-030, AT-GM-001…004, AT-HW-001 | NOT YET IMPLEMENTED | No traceable test/evidence binding yet. AT-HW-001 requires hardware QA (§16) and the Digital Twin (§25). |
+| AT-GM-001 (autonomous slice completion) | IMPLEMENTED | `TodoApp._run_loop` completes the Todo goal against evidence. `tests/test_loop.py::TestExecutionLoop::test_healthy_goal_completes_on_first_attempt` |
+| AT-GM-002 (autonomous feedback correction) | PARTIAL | Fails → feedback → corrective task → replan → re-QA → complete, verified by `::test_goal_recovers_after_a_failed_attempt`. **The repair strategy itself is a stub** — see §7; the deterministic coder regenerates the artifact rather than changing code from the root cause. |
+| AT-GM-004 (autonomous-loop detection ≤5) | IMPLEMENTED | `LoopGuard` equivalence limit + attempt budget + oscillation. `::test_unrecoverable_goal_escalates_and_stops`, `TestLoopGuard::test_equivalent_failure_limit_triggers_escalation` |
+| AT-GM-003 (24 h Goal Mode endurance) | NOT YET IMPLEMENTED | Requires a long-running harness. |
+| AT-001…AT-030 (general), AT-HW-001 | NOT YET IMPLEMENTED | No traceable test/evidence binding yet. AT-HW-001 requires hardware QA (§16) and the Digital Twin (§25). |
+
+> The constitution lists AT-GM-001…004 without defining each one. The mapping
+> above is this repository's reading of them and **should be confirmed before
+> being treated as authoritative** — the behaviours required by §18/§41/§42 are
+> implemented regardless.
 
 ---
 
@@ -131,6 +141,7 @@ Currently `COMPLETED` implies six evidence items: `qa.preview`,
 | `sandbox.Sandbox.prepare_workdir` | per-task workdir primitive; implemented and tested, not yet used to isolate each agent run | docstring |
 | `spec.GoalSpec.from_text` | deterministic heuristic | docstring |
 | `orchestrator.Orchestrator._execute_task` | in-process todo coder | inline `# TODO: plug in real codex runtime` |
+| corrective fix strategy | corrective tasks record `fix_strategy_implemented: False`; the deterministic coder regenerates the artifact instead of changing code from the root cause | result field + `docs/TRACEABILITY.md` §5 |
 
 ---
 
@@ -138,7 +149,7 @@ Currently `COMPLETED` implies six evidence items: `qa.preview`,
 
 ```bash
 cd .cline/data/workspaces/chat/jaxir-os
-python3 -m pytest -q          # 90 tests
+python3 -m pytest -q          # 127 tests
 ```
 
 | Test file | Covers |
@@ -146,3 +157,4 @@ python3 -m pytest -q          # 90 tests
 | `tests/test_kernel.py` | contracts, state machine, task graph, checkpoint, vertical slice, preview |
 | `tests/test_sandbox.py` | filesystem confinement, secrets, rlimits, network mode, permissions, orchestrator integration |
 | `tests/test_qa.py` | regression/security/performance suites, suite-coverage disclosure, Definition-of-Done integrity |
+| `tests/test_loop.py` | failure equivalence, loop guard, corrective tasks, replanning, execution-loop recovery/escalation, transition auditability |

@@ -90,41 +90,129 @@ class GoalMode:
 
     def execute(self, goal: models.Goal, project_dir: Path) -> models.Goal:
         self.project_root = project_dir
-        goal.status = models.GoalStatus.EXECUTING
+        # The state machine is the single authority for goal status, so every
+        # transition is validated and audited (locked target: 100%).
+        if goal.status in (models.GoalStatus.PLANNED, models.GoalStatus.REPLANNING):
+            self.state_m.transition(goal, models.GoalStatus.EXECUTING)
         self.orchestrator.assign(goal)
         # Commit an initial checkpoint before execution.
         self._checkpoint(goal, project_dir)
         for t in goal.task_graph:
-            t = self.orchestrator.run_task(t)
+            # Idempotent resume: completed work is never re-executed, so a
+            # replanned goal runs only its new corrective work (section 7).
+            if t.status == models.TaskStatus.COMPLETED:
+                continue
+            self.orchestrator.run_task(t)
             self._checkpoint(goal, project_dir)
-        goal.status = models.GoalStatus.VERIFYING
+        self.state_m.transition(goal, models.GoalStatus.VERIFYING)
         return goal
 
     def complete(self, goal: models.Goal) -> models.Goal:
-        goal.status = models.GoalStatus.COMPLETED
-        self.bus.publish(
-            models.Event(event_type=models.EventType.GOAL_COMPLETED,
-                         project_id=goal.project_id, goal_id=goal.goal_id)
-        )
+        """Record verification success, then completion."""
+        if goal.status != models.GoalStatus.PASSED:
+            self.state_m.transition(goal, models.GoalStatus.PASSED)
+        self.state_m.transition(goal, models.GoalStatus.COMPLETED)
         return goal
 
     def fail(self, goal: models.Goal, reason: str) -> models.Goal:
-        goal.status = models.GoalStatus.FAILED
-        self.bus.publish(
-            models.Event(event_type=models.EventType.GOAL_FAILED,
-                         project_id=goal.project_id, goal_id=goal.goal_id,
-                         payload={"reason": reason})
-        )
+        self.state_m.transition(goal, models.GoalStatus.FAILED)
+        if self.bus is not None:
+            self.bus.publish(
+                models.Event(event_type=models.EventType.GOAL_FAILED,
+                             project_id=goal.project_id, goal_id=goal.goal_id,
+                             payload={"reason": reason})
+            )
         return goal
 
-    def replan(self, goal: models.Goal) -> models.Goal:
-        goal.status = models.GoalStatus.REPLANNING
-        self.bus.publish(
-            models.Event(event_type=models.EventType.GOAL_COMPLETED,
-                         project_id=goal.project_id, goal_id=goal.goal_id,
-                         payload={"action": "replan"})
-        )
+    def block(self, goal: models.Goal, reason: str,
+              detail: Optional[Dict[str, Any]] = None) -> models.Goal:
+        """Escalate: stop, preserve evidence, request intervention (section 41)."""
+        self.state_m.transition(goal, models.GoalStatus.BLOCKED)
+        goal.state["escalation"] = {"reason": reason, **(detail or {})}
+        if self.bus is not None:
+            self.bus.publish(
+                models.Event(event_type=models.EventType.GOAL_FAILED,
+                             project_id=goal.project_id, goal_id=goal.goal_id,
+                             payload={"escalated": True, "reason": reason,
+                                      **(detail or {})})
+            )
         return goal
+
+    # ------------------------------------------------------------------
+    # Replanning (sections 18 / 51)
+    # ------------------------------------------------------------------
+
+    def replan(self, goal: models.Goal, feedback_engine: Any,
+               failures: List[Any], project_dir: Path,
+               strategy: str = "retry", attempt: int = 1) -> models.Goal:
+        """Revise the plan from failures: REPLANNING -> corrective tasks -> PLANNED.
+
+        One corrective task per root cause (deduplication and clustering happen
+        in the Feedback engine). The caller then executes the revised graph.
+        """
+        self.state_m.transition(goal, models.GoalStatus.REPLANNING)
+        specs = feedback_engine.corrective_tasks(
+            goal.goal_id, failures, project_dir, strategy=strategy,
+            attempt=attempt,
+        )
+
+        created: List[models.Task] = []
+        for spec in specs:
+            task = self._materialize_corrective(goal, spec)
+            goal.task_graph.append(task)
+            created.append(task)
+            # Close the loop: link each contributing failure to its correction.
+            for f in feedback_engine.feedback:
+                if f.feedback_id in spec["feedback_ids"]:
+                    f.corrective_task_id = task.task_id
+
+        goal.state.setdefault("replans", []).append({
+            "attempt": attempt,
+            "strategy": strategy,
+            "failures": len(failures),
+            "clusters": len(specs),
+            "corrective_tasks": [
+                {"task_id": t.task_id,
+                 "root_cause": (t.inputs or {}).get("root_cause"),
+                 "severity": (t.inputs or {}).get("severity")}
+                for t in created
+            ],
+        })
+        self.state_m.transition(goal, models.GoalStatus.PLANNED)
+        return goal
+
+    @staticmethod
+    def _materialize_corrective(goal: models.Goal,
+                                spec: Dict[str, Any]) -> models.Task:
+        """Materialise a corrective spec into an executable task.
+
+        Routed to the coder agent because the correction is an artifact change.
+        """
+        return models.Task(
+            goal_id=goal.goal_id,
+            owner_agent_id="planner",
+            agent_type="coder",
+            capabilities=["coding", "build", "sandbox_exec", "corrective"],
+            status=models.TaskStatus.PENDING,
+            inputs={
+                "project_dir": spec["project_dir"],
+                "corrective": True,
+                "root_cause": spec["root_cause"],
+                "severity": spec["severity"],
+                "symptom_signature": spec["symptom_signature"],
+                "feedback_ids": spec["feedback_ids"],
+                "strategy": spec["strategy"],
+                "attempt": spec["attempt"],
+            },
+            acceptance_criteria=[{
+                "id": "C-CORR",
+                "metric": "corrective_task_reverified",
+                "threshold": True,
+                "measurement_method": "reverify_after_correction",
+            }],
+            verification={"suite": "qa.reverify"},
+            retry_policy={"max_attempts": 1, "strategy": spec["strategy"]},
+        )
 
     def _checkpoint(self, goal: models.Goal, project_dir: Path) -> None:
         if self.cpk is None:

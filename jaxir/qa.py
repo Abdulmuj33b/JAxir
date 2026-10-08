@@ -85,6 +85,10 @@ class QAEngine:
     IMPLEMENTED_SUITES: Tuple[str, ...] = (
         "functional", "regression", "security", "performance", "preview",
     )
+    #: Aggregate suites roll other evidence up. Acting on them directly would
+    #: spawn a duplicate corrective task for a root cause already reported by
+    #: their members (section 18: many symptoms, one root cause).
+    AGGREGATE_SUITES: Tuple[str, ...] = ("qa.verdict",)
     #: Suites required by constitution section 16 with no implementation yet.
     NOT_IMPLEMENTED_SUITES: Tuple[str, ...] = (
         "visual", "accessibility", "chaos", "adversarial",

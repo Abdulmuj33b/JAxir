@@ -80,9 +80,16 @@ class Orchestrator:
         return None
 
     def assign(self, goal: models.Goal) -> List[models.Task]:
-        """Assign every task to an agent; create per-task evidence slots."""
+        """Assign every unstarted task to an agent.
+
+        Completed tasks are left alone: re-queueing them would re-run work that
+        already has evidence, which is exactly the duplicate execution of a
+        non-idempotent action the task graph must prevent (section 7).
+        """
         assigned: List[models.Task] = []
         for t in goal.task_graph:
+            if t.status == models.TaskStatus.COMPLETED:
+                continue
             agent = self.agent_for(t)
             if agent is None:
                 continue
@@ -178,13 +185,27 @@ class Orchestrator:
         workdir = self.sandbox.resolve(Path(task.inputs.get("project_dir", "")))
         workdir.mkdir(parents=True, exist_ok=True)
         cli = TodoCoder.write(workdir)
-        return {
+        result = {
             "ok": True,
             "workdir": str(workdir),
             "file": str(cli),
             "sha256": self._sha256(cli),
             "summary": "todo CLI built",
         }
+        if task.inputs.get("corrective"):
+            # A corrective task carries the root cause it must address. The
+            # regeneration itself is real and re-verified by QA; choosing *how*
+            # to change the code from the root cause is NOT implemented here -
+            # the deterministic coder ignores it. Labelled, not hidden.
+            result.update({
+                "corrective": True,
+                "root_cause": task.inputs.get("root_cause"),
+                "strategy": task.inputs.get("strategy"),
+                "attempt": task.inputs.get("attempt"),
+                "summary": "corrective regeneration (fix strategy NOT IMPLEMENTED)",
+                "fix_strategy_implemented": False,
+            })
+        return result
 
 
 

@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 from . import models
+from .loopguard import failure_signature
 
 
 @dataclass
@@ -26,6 +27,7 @@ class Feedback:
     corrective_task_id: Optional[str] = None
     accepted: bool = False
     created_at: Optional[str] = None
+    attempt: int = 1
 
 
 class FeedbackEngine:
@@ -37,10 +39,12 @@ class FeedbackEngine:
     # Create / accept
     # ------------------------------------------------------------------
 
-    def create(self, project_id: str, goal_id: str, task_id: str,
+    def create(self, project_id: str, goal_id: str, task_id: Optional[str],
                failure_event: str, symptoms: List[str],
                cluster_id: Optional[str] = None,
-               root_cause: Optional[str] = None) -> Feedback:
+               root_cause: Optional[str] = None,
+               severity: str = "info",
+               attempt: int = 1) -> Feedback:
         f = Feedback(
             feedback_id=self._uid(),
             source=f"goal:{goal_id}/task:{task_id}",
@@ -48,6 +52,8 @@ class FeedbackEngine:
             symptoms=symptoms,
             cluster_id=cluster_id,
             root_cause=root_cause,
+            severity=severity,
+            attempt=attempt,
             created_at="2026-07-10T00:00:00Z",
         )
         self.feedback.append(f)
@@ -59,7 +65,9 @@ class FeedbackEngine:
                     goal_id=goal_id,
                     task_id=task_id,
                     payload={"feedback_id": f.feedback_id, "cluster": cluster_id,
-                             "root_cause": root_cause},
+                             "root_cause": root_cause, "severity": severity,
+                             "severity_rank": self._severity_rank(severity),
+                             "signature": failure_signature(failure_event, symptoms)},
                 )
             )
         return f
@@ -135,3 +143,77 @@ class FeedbackEngine:
             out.append({"cluster_id": cid, "member_count": len(members),
                         "root_cause": rc})
         return out
+
+    # ------------------------------------------------------------------
+    # Corrective tasks (section 18: clustering -> root cause -> corrective tasks)
+    # ------------------------------------------------------------------
+
+    def prioritized_clusters(self, failures: List[Feedback]) -> List[Dict[str, Any]]:
+        """Group equivalent failures and rank them by severity then size.
+
+        Equivalent failures share a signature, so many symptoms that trace to
+        one root cause collapse into a single corrective task (the section 18
+        '47 failures -> 3 root causes' behaviour).
+        """
+        grouped: Dict[str, List[Feedback]] = {}
+        for f in failures:
+            sig = failure_signature(f.failure_event, f.symptoms)
+            grouped.setdefault(sig, []).append(f)
+
+        clusters: List[Dict[str, Any]] = []
+        for sig, members in grouped.items():
+            severity = max((m.severity for m in members),
+                           key=self._severity_rank)
+            symptoms = sorted({s for m in members for s in m.symptoms})
+            clusters.append({
+                "cluster_id": members[0].cluster_id or sig,
+                "signature": sig,
+                "failure_event": members[0].failure_event,
+                "root_cause": self.root_cause(members) or "unknown",
+                "severity": severity,
+                "severity_rank": self._severity_rank(severity),
+                "member_count": len(members),
+                "symptoms": symptoms,
+                "feedback_ids": [m.feedback_id for m in members],
+            })
+        return sorted(clusters,
+                      key=lambda c: (c["severity_rank"], c["member_count"]),
+                      reverse=True)
+
+    def corrective_tasks(self, goal_id: str, failures: List[Feedback],
+                         project_dir: Any = "", strategy: str = "retry",
+                         attempt: int = 1) -> List[Dict[str, Any]]:
+        """Turn prioritized clusters into corrective task *specs*.
+
+        Specs, not ``models.Task`` objects: the Feedback engine stays a
+        failure-analysis component, and Goal Mode (which owns the task graph)
+        materialises them. One spec per root cause.
+        """
+        specs: List[Dict[str, Any]] = []
+        for cluster in self.prioritized_clusters(failures):
+            root = cluster["root_cause"]
+            specs.append({
+                "corrective": True,
+                "goal_id": goal_id,
+                "cluster_id": cluster["cluster_id"],
+                "root_cause": root,
+                "severity": cluster["severity"],
+                "symptoms": cluster["symptoms"],
+                "symptom_signature": cluster["signature"],
+                "feedback_ids": cluster["feedback_ids"],
+                "member_count": cluster["member_count"],
+                "strategy": strategy,
+                "attempt": attempt,
+                "project_dir": str(project_dir),
+                "title": f"Correct {root}",
+                "description": (f"{cluster['member_count']} symptom(s) from "
+                                f"{cluster['failure_event']}: {root}"),
+            })
+        return specs
+
+    def resolved(self, failure_event: str,
+                 symptoms: List[str]) -> List[Feedback]:
+        """Feedback for an equivalent failure (used to close the loop)."""
+        sig = failure_signature(failure_event, symptoms)
+        return [f for f in self.feedback
+                if failure_signature(f.failure_event, f.symptoms) == sig]

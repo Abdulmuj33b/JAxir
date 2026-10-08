@@ -64,6 +64,7 @@ class GoalStateMachine:
             models.GoalStatus.ROLLED_BACK,
             models.GoalStatus.PAUSED,
             models.GoalStatus.CANCELLED,
+            models.GoalStatus.BLOCKED,
         ],
         models.GoalStatus.PAUSED: [
             models.GoalStatus.EXECUTING,
@@ -79,8 +80,32 @@ class GoalStateMachine:
         ],
         models.GoalStatus.CANCELLED: [],
         models.GoalStatus.ROLLED_BACK: [],
-        models.GoalStatus.PASSED: [],
+        models.GoalStatus.PASSED: [
+            # Verification passed; the goal engine may now record completion.
+            # Without this edge COMPLETED would be an unreachable terminal
+            # state - the success endpoint of the whole execution loop.
+            models.GoalStatus.COMPLETED,
+        ],
         models.GoalStatus.COMPLETED: [],
+    }
+
+    #: Closest event for each target state. The payload always carries the exact
+    #: ``from``/``to`` states, so auditability does not depend on this mapping;
+    #: it exists because the locked event set (section 12) has no event per state.
+    _EVENT_FOR_STATUS: Dict[models.GoalStatus, models.EventType] = {
+        models.GoalStatus.CREATED: models.EventType.GOAL_CREATED,
+        models.GoalStatus.ANALYZING: models.EventType.GOAL_ANALYZED,
+        models.GoalStatus.PLANNED: models.EventType.GOAL_PLANNED,
+        models.GoalStatus.REPLANNING: models.EventType.GOAL_PLANNED,
+        models.GoalStatus.EXECUTING: models.EventType.GOAL_RESUMED,
+        models.GoalStatus.VERIFYING: models.EventType.GOAL_RESUMED,
+        models.GoalStatus.PASSED: models.EventType.GOAL_COMPLETED,
+        models.GoalStatus.COMPLETED: models.EventType.GOAL_COMPLETED,
+        models.GoalStatus.FAILED: models.EventType.GOAL_FAILED,
+        models.GoalStatus.BLOCKED: models.EventType.GOAL_FAILED,
+        models.GoalStatus.CANCELLED: models.EventType.GOAL_FAILED,
+        models.GoalStatus.ROLLED_BACK: models.EventType.GOAL_FAILED,
+        models.GoalStatus.PAUSED: models.EventType.GOAL_PAUSED,
     }
 
     def __init__(self, event_bus: Any):
@@ -95,24 +120,37 @@ class GoalStateMachine:
                 f"Invalid goal state transition: {goal.status.value} -> "
                 f"{to_status.value} (allowed: {[s.value for s in allowed]})"
             )
+        previous = goal.status
         goal.status = to_status
         goal.updated_at = datetime_now()
+        self._audit(goal, previous, to_status)
         if self.bus is not None:
             self.bus.publish(
                 models.Event(
-                    event_type=models.EventType.GOAL_COMPLETED
-                    if to_status in (
-                        models.GoalStatus.COMPLETED,
-                        models.GoalStatus.PASSED,
-                        models.GoalStatus.FAILED,
-                    )
-                    else models.EventType.GOAL_CREATED,
+                    event_type=self._EVENT_FOR_STATUS.get(
+                        to_status, models.EventType.GOAL_CREATED),
                     project_id=goal.project_id,
                     goal_id=goal.goal_id,
-                    payload={"from": goal.status.value, "to": to_status.value},
+                    payload={"from": previous.value, "to": to_status.value},
                 )
             )
         return True
+
+    @staticmethod
+    def _audit(goal: models.Goal, previous: models.GoalStatus,
+               to_status: models.GoalStatus) -> None:
+        """Append to the goal's transition log.
+
+        The locked target is 100% auditable state transitions: every accepted
+        transition is recorded on the goal itself, so a goal that reaches a
+        terminal state carries the full path it took.
+        """
+        trail = goal.state.setdefault("transitions", [])
+        trail.append({
+            "from": previous.value,
+            "to": to_status.value,
+            "at": datetime_now().isoformat(),
+        })
 
 
 def datetime_now() -> Any:
