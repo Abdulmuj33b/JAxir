@@ -15,8 +15,10 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from . import models, goalmode, orchestrator, sandbox, preview, qa, checkpoint, registry
+from .context import ContextCompiler
 from .feedback import FeedbackEngine
 from .loopguard import LoopGuard, failure_signature
+from .quota import ProviderSpec, QuotaManager
 
 
 class TodoPlanner:
@@ -304,9 +306,13 @@ class TodoApp:
 
     ``MAX_ATTEMPTS`` bounds the Build -> QA -> Feedback -> Replan loop so an
     unrecoverable goal escalates instead of retrying forever (section 42).
+
+    ``CONTEXT_TOKEN_BUDGET`` bounds the compiled context handed to each agent
+    (section 10).
     """
 
     MAX_ATTEMPTS = 3
+    CONTEXT_TOKEN_BUDGET = 4000
 
     def __init__(self, root: Optional[str] = None):
         self.root = Path(root) if root else Path(__file__).resolve().parent.parent
@@ -337,11 +343,21 @@ class TodoApp:
             SandboxConfig(project_root=str(self.project_dir), workdir=str(self.project_dir)),
             self.bus,
         )
-        self.og = Orchestrator(self.bus, self.sb)
+        # Phase 3 infrastructure: capacity accounting, context compilation, and
+        # capacity-aware routing. The provider list is a declaration of the
+        # *local* runtime; nothing here contacts a remote provider.
+        self.quota = QuotaManager(self.bus)
+        self.quota.register(ProviderSpec(
+            name="codex", family="codex", models=["codex", "codex-max"],
+            capabilities=["code"], rate_limit=1000, token_limit=0, unit_cost=1.0,
+        ))
+        self.compiler = ContextCompiler(token_budget=self.CONTEXT_TOKEN_BUDGET)
+        self.omni = OmniRoute(RoutingPolicy(), self.bus, quota=self.quota)
+        self.og = Orchestrator(self.bus, self.sb, router=self.omni,
+                               context_compiler=self.compiler)
         self.pm = GoalStateMachine(self.bus)
         self.tg = TaskGraph(self.bus)
         self.ob = Observability(self.bus, None)
-        self.omni = OmniRoute(RoutingPolicy(), self.bus)
         self.prv = PreviewEngine(self.sb, self.bus)
         self.qae = QAEngine(self.bus, self.registry, None)
         self.fb = FeedbackEngine(self.bus)

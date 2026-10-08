@@ -102,7 +102,7 @@ class GoalMode:
             # replanned goal runs only its new corrective work (section 7).
             if t.status == models.TaskStatus.COMPLETED:
                 continue
-            self.orchestrator.run_task(t)
+            self.orchestrator.run_task(t, goal)
             self._checkpoint(goal, project_dir)
         self.state_m.transition(goal, models.GoalStatus.VERIFYING)
         return goal

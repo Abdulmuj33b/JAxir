@@ -158,11 +158,23 @@ class QAEngine:
                            "expected": expected, "actual": actual})
 
         def run(action: str, arg: Any = None) -> bool:
-            cmd = [os.path.join(project_dir, "todo"), action]
+            binary = os.path.join(project_dir, "todo")
+            cmd = [binary, action]
             if arg is not None:
                 cmd.append(str(arg))
-            r = subprocess.run(cmd, capture_output=True, text=True, timeout=10,
-                               cwd=project_dir, env=env)
+            if not os.path.exists(binary):
+                # A missing artifact is a FAIL, not a crash: the evidence has to
+                # survive so the failure can be clustered and corrected.
+                results.append({"action": action, "arg": arg, "ok": False,
+                                "stdout": "", "stderr": f"artifact missing: {binary}"})
+                return False
+            try:
+                r = subprocess.run(cmd, capture_output=True, text=True, timeout=10,
+                                   cwd=project_dir, env=env)
+            except (OSError, subprocess.SubprocessError) as exc:
+                results.append({"action": action, "arg": arg, "ok": False,
+                                "stdout": "", "stderr": f"not executable: {exc}"})
+                return False
             results.append({"action": action, "arg": arg, "ok": r.returncode == 0,
                             "stdout": r.stdout.strip(), "stderr": r.stderr.strip()})
             return r.returncode == 0

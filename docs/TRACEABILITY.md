@@ -36,7 +36,7 @@ it. The table below is the current, honest state of that chain.
 | Goal Engine | `jaxir/state.py`, `jaxir/spec.py`, `jaxir/goalmode.py` | PARTIAL | Locked 13 goal states, invalid-transition rejection, idempotent no-op, and a per-goal transition audit log (every accepted transition recorded, so 100% auditable is testable). `COMPLETED` is reachable via `PASSED`. `GoalSpec.from_text` is a deterministic heuristic placeholder, not a real NL analyser. |
 | Task Graph | `jaxir/taskgraph.py` | PARTIAL | Kahn topological order, cycle rejection, environment/resource conflict detection. File conflicts and duplicate non-idempotent execution are **NOT YET IMPLEMENTED**. |
 | Agent Orchestrator | `jaxir/orchestrator.py` | PARTIAL | Agent registry, capability-intersection routing, task execution + evidence slots. Does not yet assign model/provider/permissions/resource limits per task. |
-| Model Runtime | `jaxir/omniroute.py` | PARTIAL | Deterministic routing policy + `model.requested` events. No Model Runtime abstraction, **no Codex adapter**, no quota manager. |
+| Model Runtime | `jaxir/omniroute.py`, `jaxir/quota.py` | PARTIAL | `OmniRoute` routes by capability + complexity + **capacity**, and refuses rather than inventing capacity when no provider is usable. `QuotaManager` accounts requests/tokens/latency/failures and emits `provider.healthy/degraded/exhausted`. The Model Runtime *abstraction* and a **Codex adapter are NOT YET IMPLEMENTED** — execution is still the deterministic in-process coder. |
 | Execution Sandbox | `jaxir/sandbox.py` | PARTIAL | Real filesystem confinement, rlimits, network policy, secret scrubbing, permission broker, cleanup + orphan detection. See §4 below for what remains. |
 | Preview / Simulation | `jaxir/preview.py` | PARTIAL | Real web (HTTP-served + DOM-inspected) and terminal adapters + full `start/stop/reload/inspect/capture/status` interface. mobile/desktop/game/video/3D/embedded/hardware/API adapters are labelled `None` placeholders. |
 | QA / QC | `jaxir/qa.py` | PARTIAL | Real functional, regression, security (static audit) and performance (measured latency) evidence. Visual/accessibility/chaos/adversarial/synthetic-user/hardware QA are **NOT YET IMPLEMENTED**. |
@@ -48,8 +48,8 @@ it. The table below is the current, honest state of that chain.
 | Checkpoint Manager | `jaxir/checkpoint.py` | PARTIAL | create / restore / list / compare. **branch and replay are NOT YET IMPLEMENTED.** |
 | Observability | `jaxir/observability.py` | PARTIAL | Timer traces, decision summaries, resource snapshot. The `Goal → Task → Agent → Model → Tool → Command → File` span chain is **NOT YET IMPLEMENTED**. |
 | Memory | `jaxir/registry.py` | PARTIAL | Project/QA/agent/session indices are generic `MemoryIndex` objects. Per-level schema and Engineering Experience Memory are **NOT YET IMPLEMENTED**. |
-| Context Compiler | — | NOT YET IMPLEMENTED | §10. |
-| Quota Manager | — | NOT YET IMPLEMENTED | §11. |
+| Context Compiler | `jaxir/context.py` | PARTIAL | Real gather → dedupe → collapse-equivalent-failures → rank → select pipeline with a retention guarantee. Meets the ≥50% reduction target on a realistic corpus (measured 59.7%). The compiler supports decisions/memory/experience sources, but no caller supplies them yet — the slice feeds requirements, acceptance criteria, task definition, corrective root cause and project files. |
+| Quota Economy | `jaxir/quota.py` | PARTIAL | Local accounting and health tracking over *declared* providers: rolling rate/token windows, latency percentiles, failure-ratio degradation, provider-reported exhaustion, and `provider.*` events. Refuses rather than bypassing limits (section 11). It cannot see a provider's real quota; there is no provider integration. |
 | Permission Broker | `jaxir/sandbox.py` | PARTIAL | Capability grants, `permission.requested/granted/denied` events, protected-operation classification. No persistent policy file / UI approval flow. |
 | Project-Type Adapters | — | NOT YET IMPLEMENTED | §24. |
 | Mission Control | — | NOT YET IMPLEMENTED | §39/§40. |
@@ -74,6 +74,8 @@ it. The table below is the current, honest state of that chain.
 | AT-GM-002 (autonomous feedback correction) | PARTIAL | Fails → feedback → corrective task → replan → re-QA → complete, verified by `::test_goal_recovers_after_a_failed_attempt`. **The repair strategy itself is a stub** — see §7; the deterministic coder regenerates the artifact rather than changing code from the root cause. |
 | AT-GM-004 (autonomous-loop detection ≤5) | IMPLEMENTED | `LoopGuard` equivalence limit + attempt budget + oscillation. `::test_unrecoverable_goal_escalates_and_stops`, `TestLoopGuard::test_equivalent_failure_limit_triggers_escalation` |
 | AT-GM-003 (24 h Goal Mode endurance) | NOT YET IMPLEMENTED | Requires a long-running harness. |
+| Context reduction ≥50% retaining required information | IMPLEMENTED | `jaxir/context.py`. `tests/test_phase3.py::TestContextCompilerReduction::test_meets_locked_reduction_target` — measured **59.7%** on a corpus with 40 equivalent failures + duplicated decisions + 30 files; retention proven by `::TestContextCompilerRetention`. |
+| Provider health / no quota bypass | IMPLEMENTED | `tests/test_phase3.py::TestQuotaLimitsNeverBypassed` — a rate/token/exhausted provider raises instead of exceeding. |
 | AT-001…AT-030 (general), AT-HW-001 | NOT YET IMPLEMENTED | No traceable test/evidence binding yet. AT-HW-001 requires hardware QA (§16) and the Digital Twin (§25). |
 
 > The constitution lists AT-GM-001…004 without defining each one. The mapping
@@ -142,6 +144,8 @@ Currently `COMPLETED` implies six evidence items: `qa.preview`,
 | `spec.GoalSpec.from_text` | deterministic heuristic | docstring |
 | `orchestrator.Orchestrator._execute_task` | in-process todo coder | inline `# TODO: plug in real codex runtime` |
 | corrective fix strategy | corrective tasks record `fix_strategy_implemented: False`; the deterministic coder regenerates the artifact instead of changing code from the root cause | result field + `docs/TRACEABILITY.md` §5 |
+| `quota.QuotaManager` | accounting over *declared* providers; no provider SDK, cannot observe real quota | `snapshot()["note"]` |
+| `context.ContextCompiler` | decisions/memory/experience sources are implemented but unsupplied by any caller | this table + §2 |
 
 ---
 
@@ -149,7 +153,7 @@ Currently `COMPLETED` implies six evidence items: `qa.preview`,
 
 ```bash
 cd .cline/data/workspaces/chat/jaxir-os
-python3 -m pytest -q          # 127 tests
+python3 -m pytest -q          # 178 tests
 ```
 
 | Test file | Covers |
@@ -158,3 +162,4 @@ python3 -m pytest -q          # 127 tests
 | `tests/test_sandbox.py` | filesystem confinement, secrets, rlimits, network mode, permissions, orchestrator integration |
 | `tests/test_qa.py` | regression/security/performance suites, suite-coverage disclosure, Definition-of-Done integrity |
 | `tests/test_loop.py` | failure equivalence, loop guard, corrective tasks, replanning, execution-loop recovery/escalation, transition auditability |
+| `tests/test_phase3.py` | context compiler (reduction target + retention), quota manager (limits, health, events), capacity-aware routing |

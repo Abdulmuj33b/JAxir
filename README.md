@@ -29,8 +29,9 @@ Goal Engine (state.py, spec.py, goalmode.py)
 
 Cross-cutting: Event Bus (`events.py`), Checkpoint Manager (`checkpoint.py`),
 Artifact Registry + Memory (`registry.py`), Observability (`observability.py`),
-Model Routing (`omniroute.py`), Permission Broker (`sandbox.py`),
-Autonomous Loop Protection (`loopguard.py`).
+Model Routing (`omniroute.py`), Quota Economy (`quota.py`), Context Compiler
+(`context.py`), Permission Broker (`sandbox.py`), Autonomous Loop Protection
+(`loopguard.py`).
 
 ## The vertical slice
 
@@ -70,4 +71,5 @@ python3 -m pytest -q
 - `tests/test_sandbox.py` — filesystem confinement, secrets, rlimits, network mode, permissions
 - `tests/test_qa.py` — regression/security/performance suites, DoD integrity
 - `tests/test_loop.py` — loop guard, corrective tasks, replanning, recovery/escalation, auditability
+- `tests/test_phase3.py` — context compiler (≥50% reduction + retention), quota limits/health, capacity-aware routing
 
