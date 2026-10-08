@@ -154,9 +154,14 @@ class Orchestrator:
         return task
 
     def _provision_env(self, task: models.Task) -> None:
-        # In a real system the sandbox provisions a fresh dir + toolchain.
-        # Here we give the task a working directory.
-        task.inputs.setdefault("workdir", f"/tmp/jaxir/{task.task_id}")
+        """Record the task's sandbox-confined workdir.
+
+        The path is resolved through the sandbox so it cannot point outside the
+        allowed roots. Nothing is created here: an unused per-task directory
+        would be litter, and resource cleanup is a locked NFR (section 45).
+        """
+        confined = self.sandbox.resolve(Path(self.sandbox.cfg.workdir) / task.task_id)
+        task.inputs["workdir"] = str(confined)
 
     def _execute_task(self, task: models.Task) -> Dict[str, Any]:
         """Coder execution. For the first slice, writes the JaXir-built todo CLI.
@@ -166,13 +171,16 @@ class Orchestrator:
         from jaxir.todoslice import TodoCoder
         # Only the coder agent produces the todo CLI artifact.
         if task.agent_type != "coder":
-            return {"ok": True, "workdir": str(task.inputs.get("project_dir", "/tmp/jaxir")), "summary": "no_op"}
-        workdir = str(task.inputs.get("project_dir", "/tmp/jaxir"))
-        self.sandbox.prepare_workdir(task)
-        cli = TodoCoder.write(Path(workdir))
+            return {"ok": True, "workdir": str(task.inputs.get("workdir", "")),
+                    "summary": "no_op"}
+        # Generated code is untrusted: confine the write to the sandbox before
+        # the artifact is produced (section 13).
+        workdir = self.sandbox.resolve(Path(task.inputs.get("project_dir", "")))
+        workdir.mkdir(parents=True, exist_ok=True)
+        cli = TodoCoder.write(workdir)
         return {
             "ok": True,
-            "workdir": workdir,
+            "workdir": str(workdir),
             "file": str(cli),
             "sha256": self._sha256(cli),
             "summary": "todo CLI built",

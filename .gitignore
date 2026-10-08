@@ -18,3 +18,9 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Build output / runtime state produced by the Todo vertical slice.
+# These are generated artifacts (goal workdirs, checkpoints, todo store,
+# one-shot test runners), not source: see docs/TRACEABILITY.md.
+todo_slice/
+

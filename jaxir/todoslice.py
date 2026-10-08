@@ -488,16 +488,16 @@ class TodoApp:
 
     def _qa(self, preview_evidence: models.Evidence) -> List[models.Evidence]:
         """Preview + functional + regression + security + performance evidence."""
+        # Give QA the goal context up front so every evidence item and event is
+        # attributed to the goal (no post-hoc patching).
+        self.qae.goal_id = self._goal.goal_id
+        self.qae.project_id = self._goal.project_id
+
         ev = self.qae.test_todo(str(self.project_dir), expected_todos=1,
                                 expected_completed=1)
-        ev.goal_id = self._goal.goal_id
-        ev.project_id = self._goal.project_id
         reg = self.qae.run_regression(str(self.project_dir))
-        sec = self.qae.run_security()
+        sec = self.qae.run_security(str(self.project_dir))
         perf = self.qae.run_performance(str(self.project_dir))
-        for e in (reg, sec, perf):
-            e.goal_id = self._goal.goal_id
-            e.project_id = self._goal.project_id
         items = [preview_evidence, ev, reg, sec, perf]
         verdict = self.qae.verdict(items)
         verdict.goal_id = self._goal.goal_id
@@ -529,12 +529,28 @@ class TodoApp:
         self._goal.state["feedback_clusters"] = self.fb.get_clusters(deduped)
 
     def _verify(self, evidence: List[models.Evidence]) -> None:
-        """Verify Definition of Done; completing evidence-backed."""
-        passed = all(e.status == models.EvidenceStatus.PASS for e in evidence)
+        """Verify Definition of Done; completing evidence-backed.
+
+        Constitution section 19: every item must PASS, critical defects must be
+        zero, and every item must carry provenance. Agent claims, a successful
+        build, or passing compilation are never sufficient.
+        """
+        all_pass = all(e.status == models.EvidenceStatus.PASS for e in evidence)
+        blocking_defects = [d for d in self.qae.defects
+                            if d.severity in ("critical", "high")]
+        missing_provenance = [e.test_id for e in evidence if not e.provenance]
         self._goal.verification_requirements = [
             {"id": v.test_id, "status": v.status.value}
             for v in evidence
         ]
+        dod = {
+            "all_evidence_passed": all_pass,
+            "critical_defects": len(blocking_defects),
+            "provenance_missing": missing_provenance,
+        }
+        self._goal.state["definition_of_done"] = dod
+        passed = all_pass and not blocking_defects and not missing_provenance
+
         if passed:
             self._goal.status = models.GoalStatus.COMPLETED
             if self.bus is not None:
@@ -542,7 +558,8 @@ class TodoApp:
                     models.Event(event_type=models.EventType.GOAL_COMPLETED,
                                  project_id=self._goal.project_id,
                                  goal_id=self._goal.goal_id,
-                                 payload={"dod": "all_evidence_passed"}))
+                                 payload={"dod": "all_evidence_passed",
+                                          **dod}))
         else:
             self._goal.status = models.GoalStatus.FAILED
             if self.bus is not None:
@@ -550,6 +567,6 @@ class TodoApp:
                     models.Event(event_type=models.EventType.GOAL_FAILED,
                                  project_id=self._goal.project_id,
                                  goal_id=self._goal.goal_id,
-                                 payload={"dod": "evidence_failed",
+                                 payload={"dod": "evidence_failed", **dod,
                                           "failed": [e.test_id for e in evidence
                                                      if e.status != models.EvidenceStatus.PASS]}))
