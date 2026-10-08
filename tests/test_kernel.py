@@ -149,18 +149,51 @@ class TestTodoVerticalSlice:
         import subprocess
         cli = tmp_path / "todo_slice" / "todo"
         assert cli.exists() and (cli.stat().st_mode & 0o111)
-        r = subprocess.run([str(cli), "add", "Buy milk"], capture_output=True,
-                           text=True, timeout=10, cwd=tmp_path / "todo_slice")
+        workdir = tmp_path / "todo_slice"
+
+        def run(*args):
+            return subprocess.run([str(cli), *args], capture_output=True,
+                                  text=True, timeout=10, cwd=workdir)
+
+        # add: the item must be reported and persisted
+        r = run("add", "Buy milk")
+        assert r.returncode == 0 and "Buy milk" in r.stdout
+        # list: the item must be visible
+        r = run("list")
+        assert r.returncode == 0 and "Buy milk" in r.stdout
+        # complete: marked done
+        r = run("complete", "1")
         assert r.returncode == 0
-        r = subprocess.run([str(cli), "list"], capture_output=True,
-                           text=True, timeout=10, cwd=tmp_path / "todo_slice")
+        assert "x 1: Buy milk" in run("list").stdout
+        # delete: gone from the store
+        r = run("delete", "1")
         assert r.returncode == 0
-        r = subprocess.run([str(cli), "complete", "1"], capture_output=True,
-                           text=True, timeout=10, cwd=tmp_path / "todo_slice")
-        assert r.returncode == 0
-        r = subprocess.run([str(cli), "delete", "1"], capture_output=True,
-                           text=True, timeout=10, cwd=tmp_path / "todo_slice")
-        assert r.returncode == 0
+        assert "no todos" in run("list").stdout
+        # operating on a missing id is a real failure, not a silent no-op
+        assert run("complete", "99").returncode != 0
+
+    def test_noop_cli_cannot_produce_pass_evidence(self, tmp_path):
+        """A CLI that exits 0 without doing anything must FAIL QA.
+
+        Guards the evidence contract: exit codes alone are not evidence, so a
+        silent no-op can never be recorded as acceptance evidence.
+        """
+        from jaxir.qa import QAEngine
+        from jaxir.todoslice import TodoCoder
+
+        workdir = tmp_path / "todo_slice"
+        TodoCoder.write(workdir)
+        noop = workdir / "todo"
+        noop.write_text("#!/usr/bin/env python3\nimport sys\nsys.exit(0)\n",
+                        encoding="utf-8")
+        noop.chmod(0o755)
+
+        engine = QAEngine(events.EventBus(), None, None)
+        ev = engine.test_todo(str(workdir), expected_todos=1,
+                              expected_completed=1)
+        assert ev.status == models.EvidenceStatus.FAIL
+        assert ev.actual["all_passed"] is False
+        assert any(not c["ok"] for c in ev.actual["checks"])
 
     def test_evidence_recorded(self, app, tmp_path):
         # build() already records evidence in the registry

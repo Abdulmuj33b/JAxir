@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from . import models, goalmode, orchestrator, sandbox, preview, qa, checkpoint, registry
 
@@ -90,9 +90,12 @@ def save(todos):
     with open(STORE, "w") as f:
         json.dump(todos, f, indent=2)
 
+def next_id(todos):
+    return max((t["id"] for t in todos), default=0) + 1
+
 def cmd_add(args):
     todos = load()
-    todos.append({"id": len(todos) + 1, "text": args.text, "done": False})
+    todos.append({"id": next_id(todos), "text": args.text, "done": False})
     save(todos)
     print(f"added: {args.text}")
 
@@ -124,6 +127,26 @@ def cmd_delete(args):
         sys.exit(1)
     save(kept)
     print(f"deleted: {args.id}")
+
+def main():
+    p = argparse.ArgumentParser(prog="todo")
+    sub = p.add_subparsers(dest="cmd", required=True)
+    sp = sub.add_parser("add")
+    sp.add_argument("text")
+    sp.set_defaults(func=cmd_add)
+    lp = sub.add_parser("list")
+    lp.set_defaults(func=cmd_list)
+    cp = sub.add_parser("complete")
+    cp.add_argument("id", type=int)
+    cp.set_defaults(func=cmd_complete)
+    dp = sub.add_parser("delete")
+    dp.add_argument("id", type=int)
+    dp.set_defaults(func=cmd_delete)
+    args = p.parse_args()
+    args.func(args)
+
+if __name__ == "__main__":
+    main()
 '''
 
     @staticmethod
@@ -136,6 +159,141 @@ def cmd_delete(args):
         return cli_path
 
 
+class WebTodoApp:
+    """Coder artifact: a single-file, self-contained Todo web application.
+
+    The page is dependency-free (no CDN, no build step) so it can be served
+    from the sandbox and previewed over loopback: state lives in
+    ``localStorage`` and the UI is responsive by construction.
+    """
+
+    INDEX_HTML = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>JaXir Todo</title>
+<style>
+  :root { --bg:#0f1115; --card:#171a21; --fg:#e6e8ee; --muted:#8b93a7; --accent:#4f8cff; --done:#3ddc97; }
+  * { box-sizing:border-box; }
+  body { margin:0; font:16px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
+         background:var(--bg); color:var(--fg); display:flex; justify-content:center;
+         padding:2rem 1rem; min-height:100vh; }
+  main { width:100%; max-width:40rem; }
+  h1 { font-size:1.5rem; margin:0 0 .25rem; }
+  .sub { color:var(--muted); font-size:.875rem; margin-bottom:1.5rem; }
+  form { display:flex; gap:.5rem; margin-bottom:1rem; }
+  input[type=text] { flex:1; padding:.7rem .9rem; border-radius:.5rem;
+                     border:1px solid #262b36; background:var(--card); color:var(--fg); font:inherit; }
+  input[type=text]:focus { outline:2px solid var(--accent); outline-offset:1px; }
+  button { padding:.7rem 1rem; border:0; border-radius:.5rem; background:var(--accent);
+           color:#fff; font:inherit; font-weight:600; cursor:pointer; }
+  button:hover { filter:brightness(1.1); }
+  ul { list-style:none; margin:0; padding:0; }
+  li { display:flex; align-items:center; gap:.75rem; padding:.75rem .9rem; margin-bottom:.5rem;
+       background:var(--card); border:1px solid #21262f; border-radius:.5rem; }
+  li.done .text { text-decoration:line-through; color:var(--muted); }
+  .text { flex:1; word-break:break-word; }
+  .del { background:transparent; color:var(--muted); padding:.25rem .5rem; font-size:1.1rem; }
+  .del:hover { color:#ff6b6b; }
+  .empty { color:var(--muted); text-align:center; padding:1.5rem 0; }
+  footer { display:flex; justify-content:space-between; color:var(--muted);
+           font-size:.8125rem; margin-top:1rem; }
+  @media (max-width:480px) { body { padding:1rem .75rem; } h1 { font-size:1.25rem; } }
+</style>
+</head>
+<body>
+<main>
+  <h1>Todo</h1>
+  <div class="sub">Built by JaXir OS &middot; stored locally on this device</div>
+  <form id="new-form">
+    <input id="new-text" type="text" placeholder="What needs doing?" autocomplete="off" required>
+    <button type="submit">Add</button>
+  </form>
+  <ul id="list"></ul>
+  <footer>
+    <span id="count">0 items</span>
+    <span id="progress"></span>
+  </footer>
+</main>
+<script>
+  var KEY = "jaxir.todos";
+  var todos = [];
+  try { todos = JSON.parse(localStorage.getItem(KEY)) || []; } catch (e) { todos = []; }
+
+  function persist() { localStorage.setItem(KEY, JSON.stringify(todos)); render(); }
+
+  function add(text) {
+    var id = todos.reduce(function (m, t) { return Math.max(m, t.id); }, 0) + 1;
+    todos.push({ id: id, text: text, done: false });
+    persist();
+  }
+  function toggle(id) {
+    todos.forEach(function (t) { if (t.id === id) { t.done = !t.done; } });
+    persist();
+  }
+  function remove(id) {
+    todos = todos.filter(function (t) { return t.id !== id; });
+    persist();
+  }
+
+  function render() {
+    var list = document.getElementById("list");
+    list.innerHTML = "";
+    if (!todos.length) {
+      var empty = document.createElement("div");
+      empty.className = "empty";
+      empty.textContent = "Nothing here yet.";
+      list.appendChild(empty);
+    }
+    todos.forEach(function (t) {
+      var li = document.createElement("li");
+      if (t.done) { li.className = "done"; }
+      var box = document.createElement("input");
+      box.type = "checkbox";
+      box.checked = t.done;
+      box.addEventListener("change", function () { toggle(t.id); });
+      var span = document.createElement("span");
+      span.className = "text";
+      span.textContent = t.text;
+      var del = document.createElement("button");
+      del.className = "del";
+      del.type = "button";
+      del.textContent = "\\u00d7";
+      del.addEventListener("click", function () { remove(t.id); });
+      li.appendChild(box); li.appendChild(span); li.appendChild(del);
+      list.appendChild(li);
+    });
+    var done = todos.filter(function (t) { return t.done; }).length;
+    document.getElementById("count").textContent = todos.length + " items";
+    document.getElementById("progress").textContent = done + " done";
+  }
+
+  document.getElementById("new-form").addEventListener("submit", function (e) {
+    e.preventDefault();
+    var input = document.getElementById("new-text");
+    var text = input.value.trim();
+    if (text) { add(text); input.value = ""; }
+  });
+
+  render();
+</script>
+</body>
+</html>
+"""
+
+    #: Alias used by preview.WebContentGenerator for the web preview content.
+    WEB_APP = INDEX_HTML
+
+    @staticmethod
+    def write(project_dir: Path) -> Path:
+        """Write the todo web app into the sandbox workdir."""
+        project_dir.mkdir(parents=True, exist_ok=True)
+        index_path = project_dir / "index.html"
+        index_path.write_text(WebTodoApp.INDEX_HTML, encoding="utf-8")
+        return index_path
+
+
 class TodoApp:
     """Runs the full end-to-end Todo vertical slice through JaXir's kernel.
 
@@ -143,13 +301,13 @@ class TodoApp:
     the complete JaXir kernel lifecycle with evidence-backed completion.
     """
 
-    def __init__(self, root: str = "/home/technologists-tec/.cline/data/workspaces/chat/jaxir-os"):
-        self.root = Path(root)
+    def __init__(self, root: Optional[str] = None):
+        self.root = Path(root) if root else Path(__file__).resolve().parent.parent
         self.project_dir = self.root / "todo_slice"
         self._goal: Optional[models.Goal] = None
         self.bus = None
 
-    def build(self) -> Dict[str, Any]:
+    def build(self) -> models.Goal:
         """Assemble the kernel and run the Todo slice end-to-end."""
         from .events import EventBus
         from .state import GoalStateMachine
@@ -221,10 +379,7 @@ class TodoApp:
         # Step 2: execute task graph via orchestrator (planner + coder)
         self.goalmode.execute(self._goal, self.project_dir)
 
-        # Step 2b: generate the web app for web preview
-        self._generate_web_app()
-
-        # Step 3: preview (web adapter)
+        # Step 3: preview (web adapter) - also generates the web app artifact
         self._preview()
 
         # Step 4: QA - functional tests -> evidence
@@ -240,17 +395,20 @@ class TodoApp:
 
     def _generate_web_app(self) -> None:
         """Generate the web app into the sandbox workdir for preview."""
-        from jaxir.todoslice import WebTodoApp
-        cli = WebTodoApp.write(self.project_dir)
-        self._goal.task_graph[-1].result = {
+        index = WebTodoApp.write(self.project_dir)
+        coder_task = self._goal.task_graph[-1]
+        # Merge, never clobber: the coder task already carries the CLI result
+        # (path + sha256) that the evidence trail depends on.
+        coder_task.result = {
+            **(coder_task.result or {}),
             "ok": True,
-            "file": str(cli),
-            "summary": "web app generated",
+            "web_app": str(index),
             "preview_type": "web",
+            "summary": "todo CLI + web app built",
         }
         self.registry.register(
             registry.Artifact(name="todo_web_app", kind="web_page",
-                              path=str(cli),
+                              path=str(index),
                               linked_goal_id=self._goal.goal_id)
         )
 
@@ -264,15 +422,6 @@ class TodoApp:
         for t in self._goal.task_graph:
             if t.status == models.TaskStatus.COMPLETED and t.result:
                 t.result = {**t.result, "preview": status.to_dict()}
-        if self.bus is not None:
-            self.bus.publish(
-                models.Event(
-                    event_type=models.EventType.PREVIEW_STARTED,
-                    project_id=self._goal.project_id,
-                    goal_id=self._goal.goal_id,
-                    payload={"preview_type": "web", "url": status.url},
-                )
-            )
         self.prv.capture("web")
         if self.bus is not None:
             self.bus.publish(
@@ -280,47 +429,50 @@ class TodoApp:
                     event_type=models.EventType.PREVIEW_UPDATED,
                     project_id=self._goal.project_id,
                     goal_id=self._goal.goal_id,
-                    payload={"preview_type": "web"},
+                    payload={"preview_type": "web", "url": status.url},
                 )
             )
 
-
     def _qa(self) -> List[models.Evidence]:
         """Functional + regression + security + performance evidence."""
-        from .qa import QAEngine
-        ev_ids = []
         ev = self.qae.test_todo(str(self.project_dir), expected_todos=1,
-                                 expected_completed=1)
-        ev_ids.append(ev.evidence_id)
+                                expected_completed=1)
+        ev.goal_id = self._goal.goal_id
+        ev.project_id = self._goal.project_id
         reg = self.qae.run_regression(str(self.project_dir))
-        ev_ids.append(reg.evidence_id)
         sec = self.qae.run_security()
-        ev_ids.append(sec.evidence_id)
         perf = self.qae.run_performance(str(self.project_dir))
-        ev_ids.append(perf.evidence_id)
+        for e in (reg, sec, perf):
+            e.goal_id = self._goal.goal_id
+            e.project_id = self._goal.project_id
         verdict = self.qae.verdict([ev, reg, sec, perf])
+        verdict.goal_id = self._goal.goal_id
+        verdict.project_id = self._goal.project_id
         if self.bus is not None:
+            passed = verdict.status == models.EvidenceStatus.PASS
             self.bus.publish(
                 models.Event(
-                    event_type=(models.EventType.TEST_PASSED
-                                if verdict.status == models.EvidenceStatus.PASS
-                                else models.EventType.TEST_FAILED),
+                    event_type=(models.EventType.QA_PASSED if passed
+                                else models.EventType.QA_FAILED),
                     project_id=self._goal.project_id,
                     goal_id=self._goal.goal_id,
-                    payload={"test_id": ev.test_id, "ok": verdict.status == models.EvidenceStatus.PASS},
+                    payload={"verdict": verdict.test_id, "ok": passed,
+                             "evidence": [e.test_id for e in (ev, reg, sec, perf)],
+                             "checks": (ev.actual or {}).get("checks", [])},
                 )
             )
         return [ev, reg, sec, perf, verdict]
 
-        def _feedback(self, evidence: List[models.Evidence]) -> None:
-        """Feedback from failures -> clustering -> corrective tasks."""
+    def _feedback(self, evidence: List[models.Evidence]) -> None:
+        """Feedback from failures -> deduplication -> clustering -> root cause."""
         failed = [e for e in evidence if e.status == models.EvidenceStatus.FAIL]
-        if failed:
-            for e in failed:
-                self.fb.create(self._goal.project_id, self._goal.goal_id, None,
-                               e.test_id, ["todo_app_failure"], root_cause="todo app bug")
-            clusters = self.fb.get_clusters(self.fb.dedupe(self.fb.feedback))
-            self._goal.state["feedback_clusters"] = clusters
+        if not failed:
+            return
+        for e in failed:
+            self.fb.create(self._goal.project_id, self._goal.goal_id, None,
+                           e.test_id, ["todo_app_failure"], root_cause="todo app bug")
+        deduped = self.fb.dedupe(self.fb.feedback)
+        self._goal.state["feedback_clusters"] = self.fb.get_clusters(deduped)
 
     def _verify(self, evidence: List[models.Evidence]) -> None:
         """Verify Definition of Done; completing evidence-backed."""
@@ -339,49 +491,11 @@ class TodoApp:
                                  payload={"dod": "all_evidence_passed"}))
         else:
             self._goal.status = models.GoalStatus.FAILED
-
-    def _generate_web_app(self) -> None:
-        """Generate the web app into the sandbox workdir for preview."""
-        from jaxir.todoslice import WebTodoApp
-        cli = WebTodoApp.write(self.project_dir)
-        self._goal.task_graph[-1].result = {
-            "ok": True,
-            "file": str(cli),
-            "summary": "web app generated",
-            "preview_type": "web",
-        }
-        self.registry.register(
-            registry.Artifact(name="todo_web_app", kind="web_page",
-                              path=str(cli),
-                              linked_goal_id=self._goal.goal_id)
-        )
-
-    def _preview(self) -> None:
-        """Preview the todo app (web adapter)."""
-        self._generate_web_app()
-        status = self.prv.start(
-            "web", 8137, self._goal.goal_id, self._goal.project_id,
-            {"workdir": str(self.project_dir)},
-        )
-        for t in self._goal.task_graph:
-            if t.status == models.TaskStatus.COMPLETED and t.result:
-                t.result = {**t.result, "preview": status.to_dict()}
-        if self.bus is not None:
-            self.bus.publish(
-                models.Event(
-                    event_type=models.EventType.PREVIEW_STARTED,
-                    project_id=self._goal.project_id,
-                    goal_id=self._goal.goal_id,
-                    payload={"preview_type": "web", "url": status.url},
-                )
-            )
-        self.prv.capture("web")
-        if self.bus is not None:
-            self.bus.publish(
-                models.Event(
-                    event_type=models.EventType.PREVIEW_UPDATED,
-                    project_id=self._goal.project_id,
-                    goal_id=self._goal.goal_id,
-                    payload={"preview_type": "web"},
-                )
-            )
+            if self.bus is not None:
+                self.bus.publish(
+                    models.Event(event_type=models.EventType.GOAL_FAILED,
+                                 project_id=self._goal.project_id,
+                                 goal_id=self._goal.goal_id,
+                                 payload={"dod": "evidence_failed",
+                                          "failed": [e.test_id for e in evidence
+                                                     if e.status != models.EvidenceStatus.PASS]}))

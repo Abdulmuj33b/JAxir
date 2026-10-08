@@ -63,8 +63,19 @@ class Orchestrator:
         )
 
     def agent_for(self, task: models.Task) -> Optional[AgentModel]:
-        for aid, a in self.agents.items():
-            if a.agent_type in task.capabilities or not task.capabilities:
+        """Match a task to an agent by capability intersection.
+
+        An explicit task ``agent_type`` counts as a required capability, so a
+        coder task routes to the coder agent rather than to whoever registered
+        first. A task with no capabilities is assignable to any agent.
+        """
+        wanted = set(task.capabilities or [])
+        if task.agent_type:
+            wanted.add(task.agent_type)
+        for a in self.agents.values():
+            if not wanted:
+                return a
+            if a.agent_type in wanted or wanted & set(a.capabilities):
                 return a
         return None
 
@@ -88,7 +99,7 @@ class Orchestrator:
                     payload={"agent_id": agent.agent_id, "agent_type": agent.agent_type},
                 )
             )
-        goal.updated_at = models.ModelBase.id_of(self._now())
+        goal.updated_at = self._now()
         return assigned
 
     @staticmethod
@@ -121,7 +132,8 @@ class Orchestrator:
         task.result = result
 
         # 4. mark complete / failed
-        if result.get("ok", False):
+        ok = result.get("ok", False)
+        if ok:
             task.status = models.TaskStatus.COMPLETED
             task.completed_at = self._now()
         else:
@@ -131,11 +143,12 @@ class Orchestrator:
 
         self.bus.publish(
             models.Event(
-                event_type=models.EventType.TASK_COMPLETED,
+                event_type=(models.EventType.TASK_COMPLETED if ok
+                            else models.EventType.TASK_FAILED),
                 project_id=task.goal_id,
                 goal_id=task.goal_id,
                 task_id=task.task_id,
-                payload={"ok": result.get("ok", False)},
+                payload={"ok": ok},
             )
         )
         return task

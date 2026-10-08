@@ -44,84 +44,76 @@ class QAEngine:
                   expected_completed: int = 1) -> models.Evidence:
         """Functional tests for the Todo application.
 
-        End-to-end smoke test: add -> list -> complete -> delete. Each command
-        must succeed (return 0). The store is cleaned before the run so the
-        test is idempotent and deterministic.
+        End-to-end smoke test: add -> list -> complete -> delete. Every command
+        must exit 0 AND the persisted store must reflect the operation, so a CLI
+        that silently no-ops cannot produce PASS evidence. The store is cleaned
+        before the run so the test is idempotent and deterministic.
         """
-        import os, shutil, subprocess, sys
-        os.chdir(project_dir)
+        import json, os, subprocess
+
         # Deterministic store: point the built todo CLI at a fresh store.
         store = os.path.join(project_dir, "test_todos.json")
         if os.path.exists(store):
             os.remove(store)
         env = dict(os.environ, TODO_STORE=store)
 
-        # Build a one-shot runner so the CLI accepts the store location.
-        runner = os.path.join(project_dir, "_todo_tester.py")
-        if os.path.exists(runner):
-            os.remove(runner)
-        with open(runner, "w", encoding="utf-8") as f:
-            f.write("""#!/usr/bin/env python3
-import os, sys
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import todo
+        results: List[Dict[str, Any]] = []
+        checks: List[Dict[str, Any]] = []
 
-store = os.environ.get("TODO_STORE", "test_todos.json")
-# monkeypatch the store path for testing
-import json, os as _os
-_todo_store = store
+        def read_store() -> List[Dict[str, Any]]:
+            if not os.path.exists(store):
+                return []
+            with open(store, encoding="utf-8") as f:
+                return json.load(f)
 
-def _load():
-    if _os.path.exists(_todo_store):
-        with open(_todo_store) as f:
-            return json.load(f)
-    return []
+        def check(name: str, condition: bool, expected: Any, actual: Any) -> None:
+            checks.append({"check": name, "ok": bool(condition),
+                           "expected": expected, "actual": actual})
 
-def _save(todos):
-    with open(_todo_store, "w") as f:
-        json.dump(todos, f, indent=2)
-
-todo.load = _load
-todo.save = _save
-
-# re-execute the cmd_* dispatch for the requested action
-import argparse
-p = argparse.ArgumentParser()
-sub = p.add_subparsers(dest="cmd", required=True)
-ap = sub.add_parser("__call__")
-ap.add_argument("action")
-ap.add_argument("payload", nargs="*")
-ap.set_defaults(func=None)
-args = p.parse_args()
-""")
-        # Actually, replacing the CLI internals with a real smoke test is cleaner.
-        # We just invoke the built todo binary for add/list/complete/delete.
-        results = []
-        def run(action, arg=None):
+        def run(action: str, arg: Any = None) -> bool:
             cmd = [os.path.join(project_dir, "todo"), action]
             if arg is not None:
-                cmd.append(arg)
+                cmd.append(str(arg))
             r = subprocess.run(cmd, capture_output=True, text=True, timeout=10,
                                cwd=project_dir, env=env)
             results.append({"action": action, "arg": arg, "ok": r.returncode == 0,
                             "stdout": r.stdout.strip(), "stderr": r.stderr.strip()})
             return r.returncode == 0
 
-        ok_add = run("add", "Buy milk")
-        ok_list = run("list")
-        ok_complete = run("complete", "1")
-        ok_delete = run("delete", "1")
+        run("add", "Buy milk")
+        after_add = read_store()
+        check("todo_count_after_add", len(after_add) == expected_todos,
+              {"count": expected_todos}, {"count": len(after_add)})
 
-        all_ok = all(r["ok"] for r in results)
+        run("list")
+        check("list_shows_item", "Buy milk" in results[-1]["stdout"],
+              {"contains": "Buy milk"}, {"stdout": results[-1]["stdout"]})
+
+        run("complete", 1)
+        after_complete = read_store()
+        completed = sum(1 for t in after_complete if t.get("done"))
+        check("completed_after_complete", completed == expected_completed,
+              {"completed": expected_completed}, {"completed": completed})
+
+        run("delete", 1)
+        after_delete = read_store()
+        check("todo_count_after_delete", len(after_delete) == 0,
+              {"count": 0}, {"count": len(after_delete)})
+
+        all_ok = all(r["ok"] for r in results) and all(c["ok"] for c in checks)
         evid = models.Evidence(test_id="qa.todo.functional",
                                goal_id=None, project_id=None)
         evid.status = models.EvidenceStatus.PASS if all_ok else models.EvidenceStatus.FAIL
-        evid.expected = {"expected_todos": expected_todos, "expected_completed": expected_completed}
-        evid.actual = {"results": results, "all_passed": all_ok}
+        evid.expected = {"expected_todos": expected_todos,
+                         "expected_completed": expected_completed,
+                         "sequence": ["add", "list", "complete", "delete"]}
+        evid.actual = {"commands": results, "checks": checks, "all_passed": all_ok}
+        evid.artifacts = [store] if os.path.exists(store) else []
         evid.provenance = {
             "test_id": "qa.todo.functional",
-            "method": "todo_cli_e2e",
+            "method": "todo_cli_e2e_with_store_assertions",
             "project_dir": project_dir,
+            "store": store,
             "environment": {"cwd": project_dir},
         }
         import datetime
@@ -130,7 +122,7 @@ args = p.parse_args()
         if not all_ok:
             self.defects.append(
                 Defect(evidence_id=evid.evidence_id, test_id=evid.test_id,
-                       severity="info", expected=evid.expected, actual=evid.actual)
+                       severity="high", expected=evid.expected, actual=evid.actual)
             )
 
         if self.bus is not None:
@@ -146,23 +138,6 @@ args = p.parse_args()
         if self.registry is not None:
             self.registry.add_evidence([evid])
         return evid
-
-
-
-    @staticmethod
-    def _run_todo(project_dir: str, action: str, payload: str) -> bool:
-        """Deterministic todo CLI smoke test. The todo app is built below."""
-        # Placeholder: real implementation exercises the built binary.
-        import os, subprocess, sys
-        todocmd = os.path.join(project_dir, "todo")
-        if not os.path.exists(todocmd):
-            return True  # stub: assume built app present for determinism
-        try:
-            r = subprocess.run([todocmd, action, payload], capture_output=True,
-                               text=True, timeout=10, cwd=project_dir)
-            return r.returncode == 0
-        except Exception:
-            return False
 
     # ------------------------------------------------------------------
     # Regression, security, performance (extensions)

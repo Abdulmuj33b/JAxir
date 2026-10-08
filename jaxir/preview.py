@@ -174,7 +174,9 @@ class WebContentGenerator:
                  project_dir: str, artifacts: Dict[str, str]) -> str:
         """Returns the content to serve for a web preview."""
         if project_type == "web" and artifacts.get("todo_app"):
-            # self-contained Todo web app (written by WebTodoApp)
+            # self-contained Todo web app (written by WebTodoApp).
+            # Imported lazily: todoslice imports this module at load time.
+            from .todoslice import WebTodoApp
             return WebTodoApp.WEB_APP
         if project_type == "terminal" and artifacts.get("todo_app"):
             # placeholder: terminal adapter handles CLI previews directly
