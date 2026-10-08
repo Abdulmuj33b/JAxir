@@ -21,55 +21,57 @@ from .mission_control import MissionControl
 from .traceability import default_traceability
 
 
-def _load_live_goal(project_dir: Optional[str] = None) -> tuple:
-    """Load live goal state from the latest checkpoint.
-    
-    Returns: (goal, tasks, evidence) tuple from the most recent checkpoint,
-    or (None, [], []) if no checkpoint exists.
+def _load_live_goal(project_dir: Optional[str] = None):
+    """Load live goal/task state from the latest checkpoint on disk.
+
+    This is the real source of truth used by Mission Control. Demo payloads are
+    only a fallback when no checkpoint is available.
     """
+    from . import models
     from .checkpoint import CheckpointManager
     from .events import EventBus
-    from .registry import Registry
 
-    if not project_dir:
-        project_dir = str(Path.cwd() / "todo_slice")
-    
+    project_path = Path(project_dir) if project_dir else Path.cwd() / "todo_slice"
+    if not project_path.exists():
+        return None, [], []
+
     try:
-        project_path = Path(project_dir)
-        if not project_path.exists():
-            return None, [], []
-        
         bus = EventBus()
         cp_mgr = CheckpointManager(str(project_path), bus)
         record = cp_mgr.latest()
-        
-        if not record:
+        if record is None:
             return None, [], []
-        
-        # Reconstruct goal and tasks from checkpoint
-        from . import models
-        
+
         goal = models.Goal.from_dict(record["goal_state"])
         tasks = [
-            models.Task.from_dict(t)
-            for t in (record.get("task_state") or {}).values()
+            models.Task.from_dict(task_state)
+            for task_state in (record.get("task_state") or {}).values()
         ]
-        
-        # Collect evidence from registry
-        registry = Registry(str(project_path), bus)
-        artifacts = registry.list_artifacts(goal.goal_id)
-        evidence = [
-            models.Evidence.from_dict(a) 
-            for a in artifacts 
-            if isinstance(a, dict)
-        ]
-        
+
+        evidence = []
+        for item in goal.verification_requirements or []:
+            test_id = str(item.get("id", "unknown"))
+            raw_status = item.get("status", "NOT_RUN")
+            try:
+                status = models.EvidenceStatus(raw_status)
+            except ValueError:
+                status = models.EvidenceStatus.NOT_RUN
+            evidence.append(
+                models.Evidence(
+                    test_id=test_id,
+                    status=status,
+                    goal_id=goal.goal_id,
+                    project_id=goal.project_id,
+                    provenance={"source": "checkpoint.goal.verification_requirements"},
+                )
+            )
+
         return goal, tasks, evidence
-    except Exception as e:
+    except Exception:
         return None, [], []
 
 
-def _demo_goal() -> tuple:
+def _demo_goal():
     """Demo goal for testing without a live project."""
     from .models import Evidence, EvidenceStatus, Goal, GoalStatus, Task, TaskStatus
 
@@ -104,10 +106,10 @@ def main(argv=None) -> int:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  jaxir-cli                      # Show live mission summary
+  jaxir-cli                      # Show live mission summary from checkpoint state
   jaxir-cli --traceability       # Show requirement traceability
   jaxir-cli --project /path      # Show mission for a specific project
-  jaxir-cli --demo               # Show demo mission (no live project required)
+  jaxir-cli --demo               # Show demo mission (fallback only)
         """,
     )
     parser.add_argument(
@@ -124,7 +126,7 @@ Examples:
     parser.add_argument(
         "--demo",
         action="store_true",
-        help="Use demo goal instead of loading live state.",
+        help="Use demo goal instead of loading live state (fallback mode).",
     )
     parser.add_argument(
         "--json",
@@ -137,30 +139,28 @@ Examples:
         print(json.dumps(default_traceability().summary(), indent=2))
         return 0
 
-    # Load goal state: live or demo
     if args.demo:
         goal, tasks, evidence = _demo_goal()
         source = "demo"
     else:
         goal, tasks, evidence = _load_live_goal(args.project)
-        source = "live" if goal else "none"
-    
-    if goal is None and not args.demo:
-        print("error: no live goal found and --demo not specified", file=sys.stderr)
-        print(f"hint: pass --project /path or use --demo", file=sys.stderr)
+        source = "live" if goal is not None else "none"
+
+    if goal is None:
+        print("error: no live goal found and no --demo fallback requested", file=sys.stderr)
+        print("hint: run with --demo or build a goal into ./todo_slice", file=sys.stderr)
         return 1
 
     control = MissionControl(goal=goal, tasks=tasks, evidence=evidence)
-    
+
     if args.json:
-        snapshot = control.snapshot()
-        snapshot_dict = snapshot.to_dict()
-        snapshot_dict["_source"] = source
-        print(json.dumps(snapshot_dict, indent=2))
+        snapshot = control.snapshot().to_dict()
+        snapshot["source"] = source
+        print(json.dumps(snapshot, indent=2))
     else:
         print(control.render_text())
         print(f"\n[source: {source}]")
-    
+
     return 0
 
 
