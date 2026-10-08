@@ -41,6 +41,9 @@ class MissionSnapshot:
             "take_control",
         ]
     )
+    event_counts: Dict[str, int] = field(default_factory=dict)
+    recent_events: List[str] = field(default_factory=list)
+    last_event: str = "n/a"
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -57,6 +60,9 @@ class MissionSnapshot:
             "active_agent": self.active_agent,
             "preview_status": self.preview_status,
             "human_actions": list(self.human_actions),
+            "event_counts": dict(self.event_counts),
+            "recent_events": list(self.recent_events),
+            "last_event": self.last_event,
         }
 
     def to_json(self) -> str:
@@ -68,10 +74,17 @@ class MissionControl:
     """Operational summary for Goal Mode and execution loops."""
 
     def __init__(self, goal: Optional[Any] = None, tasks: Optional[Iterable[Any]] = None,
-                 evidence: Optional[Iterable[Any]] = None):
+                 evidence: Optional[Iterable[Any]] = None, event_bus: Optional[Any] = None):
         self.goal = goal
         self.tasks = list(tasks or [])
         self.evidence = list(evidence or [])
+        self.event_bus = event_bus
+
+    @classmethod
+    def from_event_bus(cls, bus: Any, goal_id: Optional[str] = None,
+                       goal: Optional[Any] = None, tasks: Optional[Iterable[Any]] = None,
+                       evidence: Optional[Iterable[Any]] = None) -> "MissionControl":
+        return cls(goal=goal, tasks=tasks, evidence=evidence, event_bus=bus)
 
     def bind_goal(self, goal: Any) -> "MissionControl":
         self.goal = goal
@@ -85,32 +98,37 @@ class MissionControl:
         self.evidence = list(evidence)
         return self
 
+    def bind_event_bus(self, event_bus: Any) -> "MissionControl":
+        self.event_bus = event_bus
+        return self
+
+    def _event_summary(self) -> Dict[str, Any]:
+        if self.event_bus is None:
+            return {"counts": {}, "recent": [], "last": "n/a"}
+        events = self.event_bus.get(goal_id=getattr(self.goal, "goal_id", None)) if self.goal else self.event_bus.get()
+        counts: Dict[str, int] = {}
+        for event in events:
+            key = event.event_type.value
+            counts[key] = counts.get(key, 0) + 1
+        recent = [event.event_type.value for event in events[-5:]]
+        last = events[-1].event_type.value if events else "n/a"
+        return {"counts": counts, "recent": recent, "last": last}
+
     def snapshot(self) -> MissionSnapshot:
         if self.goal is None:
             return MissionSnapshot()
 
         total = len(self.tasks)
-        completed = sum(
-            1 for t in self.tasks
-            if getattr(t, "status", None) and str(t.status).lower() == "completed"
-        )
-        failed = sum(
-            1 for t in self.tasks
-            if getattr(t, "status", None) and str(t.status).lower() == "failed"
-        )
-        passed = sum(
-            1 for e in self.evidence
-            if getattr(e, "status", None) and str(e.status).upper() == "PASS"
-        )
-        failed_evidence = sum(
-            1 for e in self.evidence
-            if getattr(e, "status", None) and str(e.status).upper() == "FAIL"
-        )
+        completed = sum(1 for t in self.tasks if getattr(t, "status", None) and str(t.status).lower() == "completed")
+        failed = sum(1 for t in self.tasks if getattr(t, "status", None) and str(t.status).lower() == "failed")
+        passed = sum(1 for e in self.evidence if getattr(e, "status", None) and str(e.status).upper() == "PASS")
+        failed_evidence = sum(1 for e in self.evidence if getattr(e, "status", None) and str(e.status).upper() == "FAIL")
 
         progress = 0.0
         if total > 0:
             progress = (completed / total) * 100.0
 
+        event_summary = self._event_summary()
         return MissionSnapshot(
             goal_id=getattr(self.goal, "goal_id", None),
             project_id=getattr(self.goal, "project_id", None),
@@ -128,6 +146,9 @@ class MissionControl:
             evidence_failed=failed_evidence,
             active_agent=self._active_agent(),
             preview_status=self._preview_status(),
+            event_counts=event_summary["counts"],
+            recent_events=event_summary["recent"],
+            last_event=event_summary["last"],
         )
 
     def _active_agent(self) -> str:
@@ -162,6 +183,9 @@ class MissionControl:
 
     def render_text(self) -> str:
         snap = self.snapshot()
+        event_summary = ""
+        if snap.event_counts:
+            event_summary = " | ".join(f"{k}={v}" for k, v in snap.event_counts.items())
         lines = [
             "JaXir Mission Control",
             "====================",
@@ -173,6 +197,8 @@ class MissionControl:
             f"Evidence: {snap.evidence_passed} passed / {snap.evidence_failed} failed",
             f"Active agent: {snap.active_agent}",
             f"Preview: {snap.preview_status}",
+            f"Last event: {snap.last_event}",
+            f"Event summary: {event_summary if event_summary else 'n/a'}",
             "Human actions: " + ", ".join(snap.human_actions),
         ]
         return "\n".join(lines)
