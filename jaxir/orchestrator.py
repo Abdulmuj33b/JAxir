@@ -113,6 +113,16 @@ class Orchestrator:
                 continue
             t.agent_id = agent.agent_id
             t.agent_type = agent.agent_type
+            t.model_id = agent.model_runtime or t.model_id or "local"
+            t.provider = agent.model_runtime or t.provider or "local"
+            t.inputs.setdefault("required_permissions", list(getattr(goal, "permissions_required", []) or []))
+            if goal.permissions_required:
+                t.inputs["required_permissions"] = list(goal.permissions_required)
+            t.inputs.setdefault("resource_limits", dict(getattr(goal, "resource_limits", {}) or {}))
+            if getattr(goal, "resource_limits", None):
+                t.inputs["resource_limits"] = dict(goal.resource_limits)
+            t.inputs.setdefault("agent_permissions", list(agent.permissions or []))
+            t.inputs.setdefault("project_limits", {"cpu": 1, "memory_mb": 512})
             t.status = models.TaskStatus.QUEUED
             assigned.append(t)
             self.bus.publish(
@@ -121,7 +131,8 @@ class Orchestrator:
                     project_id=goal.project_id,
                     goal_id=goal.goal_id,
                     task_id=t.task_id,
-                    payload={"agent_id": agent.agent_id, "agent_type": agent.agent_type},
+                    payload={"agent_id": agent.agent_id, "agent_type": agent.agent_type,
+                             "model_id": t.model_id, "provider": t.provider},
                 )
             )
         goal.updated_at = self._now()
@@ -132,15 +143,26 @@ class Orchestrator:
         import datetime as _dt
         return _dt.datetime.now(_dt.timezone.utc)
 
+    @staticmethod
+    def _project_id_for(task: models.Task, goal: Optional[models.Goal] = None) -> str:
+        if goal is not None and getattr(goal, "project_id", None):
+            return str(goal.project_id)
+        if isinstance(task.inputs, dict):
+            project_id = task.inputs.get("project_id")
+            if project_id:
+                return str(project_id)
+        return str(task.goal_id)
+
     def run_task(self, task: models.Task,
                  goal: Optional[models.Goal] = None) -> models.Task:
         """Execute a task through the sandbox + coder agent."""
+        project_id = self._project_id_for(task, goal)
         # 1. engine switches to EXECUTING
         if self.bus is not None:
             self.bus.publish(
                 models.Event(
                     event_type=models.EventType.TASK_STARTED,
-                    project_id=task.goal_id,
+                    project_id=project_id,
                     goal_id=task.goal_id,
                     task_id=task.task_id,
                     payload={"agent_id": task.agent_id},
@@ -149,6 +171,26 @@ class Orchestrator:
         task.status = models.TaskStatus.RUNNING
         task.started_at = self._now()
         task.updated_at = self._now()
+
+        required_permissions = self._required_permissions(task)
+        if required_permissions:
+            for operation in required_permissions:
+                try:
+                    self.sandbox.require_permission(operation, project_id=project_id, goal_id=task.goal_id,
+                                                   resource=str(task.inputs.get("workdir") or task.task_id),
+                                                   reason=f"task {task.task_id} requires permission {operation}")
+                except Exception as exc:  # PermissionDenied and related enforcement errors
+                    task.status = models.TaskStatus.FAILED
+                    task.failure_state = {"stage": "permission", "reason": str(exc), "operation": operation}
+                    task.completed_at = self._now()
+                    if self.bus is not None:
+                        self.bus.publish(
+                            models.Event(event_type=models.EventType.TASK_FAILED,
+                                         project_id=project_id, goal_id=task.goal_id,
+                                         task_id=task.task_id,
+                                         payload={"ok": False, "reason": str(exc), "operation": operation})
+                        )
+                    return task
 
         # 2. route: capability + complexity + quota. A refusal stops the task
         #    honestly instead of pretending a provider is available (section 11).
@@ -160,7 +202,7 @@ class Orchestrator:
             if self.bus is not None:
                 self.bus.publish(
                     models.Event(event_type=models.EventType.TASK_FAILED,
-                                 project_id=task.goal_id, goal_id=task.goal_id,
+                                 project_id=project_id, goal_id=task.goal_id,
                                  task_id=task.task_id,
                                  payload={"ok": False, "reason": route.get("reason"),
                                           "provider": route.get("provider")})
@@ -178,7 +220,7 @@ class Orchestrator:
         task.result = result
 
         # 6. close out the model lifecycle for this task.
-        self._record_model_outcome(task, route, result)
+        self._record_model_outcome(task, route, result, goal)
 
         # 7. mark complete / failed
         ok = result.get("ok", False)
@@ -194,13 +236,26 @@ class Orchestrator:
             models.Event(
                 event_type=(models.EventType.TASK_COMPLETED if ok
                             else models.EventType.TASK_FAILED),
-                project_id=task.goal_id,
+                project_id=project_id,
                 goal_id=task.goal_id,
                 task_id=task.task_id,
                 payload={"ok": ok},
             )
         )
         return task
+
+    @staticmethod
+    def _required_permissions(task: models.Task) -> List[str]:
+        perms = task.inputs.get("required_permissions", []) if task.inputs else []
+        names: List[str] = []
+        for item in perms:
+            if isinstance(item, dict):
+                op = item.get("operation") or item.get("id") or item.get("permission")
+                if op:
+                    names.append(str(op))
+            elif isinstance(item, str):
+                names.append(item)
+        return names
 
     def _provision_env(self, task: models.Task) -> None:
         """Record the task's sandbox-confined workdir.
@@ -279,10 +334,11 @@ class Orchestrator:
         return files
 
     def _record_model_outcome(self, task: models.Task, route: Optional[Dict[str, Any]],
-                              result: Dict[str, Any]) -> None:
+                              result: Dict[str, Any], goal: Optional[models.Goal] = None) -> None:
         """Emit model.completed/model.failed and account for the provider."""
         if route is None:
             return
+        project_id = self._project_id_for(task, goal)
         ok = bool(result.get("ok", False))
         payload = {
             "model_id": route.get("model_id"), "provider": route.get("provider"),
@@ -293,7 +349,7 @@ class Orchestrator:
                 models.Event(
                     event_type=(models.EventType.MODEL_COMPLETED if ok
                                 else models.EventType.MODEL_FAILED),
-                    project_id=task.goal_id, goal_id=task.goal_id,
+                    project_id=project_id, goal_id=task.goal_id,
                     task_id=task.task_id, payload=payload,
                 )
             )

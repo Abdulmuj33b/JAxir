@@ -21,6 +21,9 @@ class Feedback:
     source: str
     failure_event: str
     symptoms: List[str]
+    project_id: str = "todo"
+    goal_id: Optional[str] = None
+    task_id: Optional[str] = None
     cluster_id: Optional[str] = None
     root_cause: Optional[str] = None
     severity: str = "info"
@@ -50,6 +53,9 @@ class FeedbackEngine:
             source=f"goal:{goal_id}/task:{task_id}",
             failure_event=failure_event,
             symptoms=symptoms,
+            project_id=project_id,
+            goal_id=goal_id,
+            task_id=task_id,
             cluster_id=cluster_id,
             root_cause=root_cause,
             severity=severity,
@@ -80,9 +86,9 @@ class FeedbackEngine:
                     self.bus.publish(
                         models.Event(
                             event_type=models.EventType.FEEDBACK_ACCEPTED,
-                            project_id="todo",
-                            goal_id=None,
-                            task_id=None,
+                            project_id=f.project_id,
+                            goal_id=f.goal_id,
+                            task_id=f.task_id,
                             payload={"feedback_id": f.feedback_id},
                         )
                     )

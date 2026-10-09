@@ -1,0 +1,75 @@
+#!/usr/bin/env python3
+# JaXir-built Todo application (single-file CLI).
+
+import json, os, sys, argparse
+
+TODO_STORE = os.environ.get("TODO_STORE", os.path.join(os.path.dirname(os.path.abspath(__file__)), "todos.json"))
+STORE = TODO_STORE
+
+def load():
+    if os.path.exists(STORE):
+        with open(STORE) as f:
+            return json.load(f)
+    return []
+
+def save(todos):
+    with open(STORE, "w") as f:
+        json.dump(todos, f, indent=2)
+
+def next_id(todos):
+    return max((t["id"] for t in todos), default=0) + 1
+
+def cmd_add(args):
+    todos = load()
+    todos.append({"id": next_id(todos), "text": args.text, "done": False})
+    save(todos)
+    print(f"added: {args.text}")
+
+def cmd_list(args):
+    todos = load()
+    if not todos:
+        print("(no todos)")
+        return
+    for t in todos:
+        mark = "x" if t["done"] else " "
+        print(f"{mark} {t['id']}: {t['text']}")
+
+def cmd_complete(args):
+    todos = load()
+    for t in todos:
+        if t["id"] == args.id:
+            t["done"] = True
+            save(todos)
+            print(f"completed: {args.id}")
+            return
+    print(f"no todo {args.id}", file=sys.stderr)
+    sys.exit(1)
+
+def cmd_delete(args):
+    todos = load()
+    kept = [t for t in todos if t["id"] != args.id]
+    if len(kept) == len(todos):
+        print(f"no todo {args.id}", file=sys.stderr)
+        sys.exit(1)
+    save(kept)
+    print(f"deleted: {args.id}")
+
+def main():
+    p = argparse.ArgumentParser(prog="todo")
+    sub = p.add_subparsers(dest="cmd", required=True)
+    sp = sub.add_parser("add")
+    sp.add_argument("text")
+    sp.set_defaults(func=cmd_add)
+    lp = sub.add_parser("list")
+    lp.set_defaults(func=cmd_list)
+    cp = sub.add_parser("complete")
+    cp.add_argument("id", type=int)
+    cp.set_defaults(func=cmd_complete)
+    dp = sub.add_parser("delete")
+    dp.add_argument("id", type=int)
+    dp.set_defaults(func=cmd_delete)
+    args = p.parse_args()
+    args.func(args)
+
+if __name__ == "__main__":
+    main()

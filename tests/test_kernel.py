@@ -7,7 +7,7 @@ import sys
 import pytest
 
 sys.path.insert(0, ".")
-from jaxir import models, events, state, taskgraph, checkpoint, registry
+from jaxir import models, events, state, taskgraph, checkpoint, registry, spec, orchestrator
 
 
 def make_goal():
@@ -46,6 +46,124 @@ class TestGoalStateMachine:
         assert goal.status == models.GoalStatus.ANALYZING
 
 
+class TestGoalSpec:
+    def test_goal_spec_from_text_extracts_requirements_and_verification(self):
+        goal = make_goal()
+        goal.user_intent = (
+            "Build a secure todo app with preview verification, error handling, "
+            "and a fast list view"
+        )
+        goal.title = "Secure Todo App"
+
+        parsed = spec.GoalSpec.from_text("proj-1", goal.user_intent, goal)
+
+        assert parsed.title == "Secure Todo App"
+        assert parsed.project_type == "web"
+        assert any("secure" in req.get("description", "").lower() for req in parsed.requirements)
+        assert any(item.get("id") == "qa.preview" for item in parsed.verification_requirements)
+        assert any("security" in cap.lower() for cap in parsed.required_capabilities)
+
+
+class TestOrchestrator:
+    def test_assign_binds_runtime_permissions_and_limits(self):
+        bus = events.EventBus()
+        sandbox = type("SandboxStub", (), {"cfg": type("Cfg", (), {"workdir": "/tmp"})()})()
+        og = orchestrator.Orchestrator(bus, sandbox)
+        og.register(
+            orchestrator.AgentModel(
+                agent_id="coder-1",
+                agent_type="coder",
+                identity="coder",
+                capabilities=["coding"],
+                tools=["write"],
+                permissions=[{"id": "fs-write", "scope": "workspace"}],
+                model_runtime="codex-fast",
+                environment={"project_id": "proj-1"},
+            )
+        )
+        goal = models.Goal(
+            project_id="proj-1",
+            user_intent="build secure todo app",
+            title="Secure Todo App",
+            permissions_required=[{"id": "fs-write", "scope": "workspace"}],
+            resource_limits={"cpu": 1, "memory_mb": 512},
+        )
+        task = models.Task(
+            goal_id=goal.goal_id,
+            owner_agent_id="planner",
+            task_id="task-1",
+            agent_type="coder",
+            capabilities=["coding"],
+            status=models.TaskStatus.PENDING,
+        )
+        goal.task_graph = [task]
+
+        og.assign(goal)
+
+        assert task.model_id == "codex-fast"
+        assert task.provider == "codex-fast"
+        assert task.inputs["required_permissions"] == [{"id": "fs-write", "scope": "workspace"}]
+        assert task.inputs["resource_limits"] == {"cpu": 1, "memory_mb": 512}
+
+    def test_run_task_enforces_required_permissions(self):
+        bus = events.EventBus()
+        sandbox = type(
+            "SandboxStub",
+            (),
+            {"cfg": type("Cfg", (), {"workdir": "/tmp"})(), "require_permission": lambda self, op, **kwargs: (_ for _ in ()).throw(__import__("jaxir.sandbox", fromlist=["PermissionDenied"]).PermissionDenied(f"bad {op}"))},
+        )()
+        og = orchestrator.Orchestrator(bus, sandbox)
+        task = models.Task(
+            goal_id="g",
+            owner_agent_id="planner",
+            task_id="task-2",
+            agent_type="coder",
+            capabilities=["coding"],
+            inputs={"project_dir": "/tmp", "required_permissions": ["deploy.production"]},
+            status=models.TaskStatus.PENDING,
+        )
+
+        result = og.run_task(task)
+
+        assert result.status == models.TaskStatus.FAILED
+        assert result.failure_state["stage"] == "permission"
+        assert "deploy.production" in result.failure_state["reason"]
+
+    def test_task_events_use_project_id_not_goal_id(self):
+        bus = events.EventBus()
+        sandbox = type(
+            "SandboxStub",
+            (),
+            {
+                "cfg": type("Cfg", (), {"workdir": "/tmp"})(),
+                "resolve": lambda self, path, must_exist=False: path,
+                "require_permission": lambda *args, **kwargs: None,
+                "child_env": lambda self, extra=None: {},
+            },
+        )()
+        og = orchestrator.Orchestrator(bus, sandbox)
+        goal = models.Goal(
+            project_id="proj-42",
+            user_intent="ship feature",
+            title="Feature",
+        )
+        task = models.Task(
+            goal_id=goal.goal_id,
+            owner_agent_id="planner",
+            task_id="task-3",
+            agent_type="coder",
+            capabilities=["coding"],
+            inputs={"required_permissions": []},
+            status=models.TaskStatus.PENDING,
+        )
+
+        og.run_task(task, goal=goal)
+
+        started = bus.get(event_type=models.EventType.TASK_STARTED, project_id="proj-42")
+        assert started
+        assert started[-1].goal_id == goal.goal_id
+
+
 class TestTaskGraph:
     def test_topological_order(self):
         bus = events.EventBus()
@@ -70,6 +188,52 @@ class TestTaskGraph:
                         status=models.TaskStatus.PENDING, dependencies=["a"])
         with pytest.raises(ValueError):
             tg.topological_order([a, b])
+
+    def test_detects_file_conflict_between_tasks(self):
+        bus = events.EventBus()
+        tg = taskgraph.TaskGraph(bus)
+        a = models.Task(
+            goal_id="p",
+            owner_agent_id="planner",
+            task_id="a",
+            status=models.TaskStatus.PENDING,
+            inputs={"path": "/tmp/shared.txt", "op": "write"},
+        )
+        b = models.Task(
+            goal_id="p",
+            owner_agent_id="coder",
+            task_id="b",
+            status=models.TaskStatus.PENDING,
+            inputs={"path": "/tmp/shared.txt", "op": "write"},
+        )
+
+        conflicts = tg.detect_conflicts([a, b], "proj")
+
+        assert any(c.kind == taskgraph.ConflictKind.FILE for c in conflicts)
+        assert any("shared.txt" in c.description for c in conflicts)
+
+    def test_detects_duplicate_non_idempotent_action(self):
+        bus = events.EventBus()
+        tg = taskgraph.TaskGraph(bus)
+        a = models.Task(
+            goal_id="p",
+            owner_agent_id="planner",
+            task_id="a",
+            status=models.TaskStatus.PENDING,
+            inputs={"operation": "deploy", "idempotent": False},
+        )
+        b = models.Task(
+            goal_id="p",
+            owner_agent_id="coder",
+            task_id="b",
+            status=models.TaskStatus.PENDING,
+            inputs={"operation": "deploy", "idempotent": False},
+        )
+
+        conflicts = tg.detect_conflicts([a, b], "proj")
+
+        assert any(c.kind == taskgraph.ConflictKind.RESOURCE for c in conflicts)
+        assert any("deploy" in c.description.lower() for c in conflicts)
 
 
 class TestEventBus:

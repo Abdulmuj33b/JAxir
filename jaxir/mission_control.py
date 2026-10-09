@@ -84,7 +84,9 @@ class MissionControl:
     def from_event_bus(cls, bus: Any, goal_id: Optional[str] = None,
                        goal: Optional[Any] = None, tasks: Optional[Iterable[Any]] = None,
                        evidence: Optional[Iterable[Any]] = None) -> "MissionControl":
-        return cls(goal=goal, tasks=tasks, evidence=evidence, event_bus=bus)
+        control = cls(goal=goal, tasks=tasks, evidence=evidence, event_bus=bus)
+        control.goal_id = goal_id
+        return control
 
     def bind_goal(self, goal: Any) -> "MissionControl":
         self.goal = goal
@@ -102,10 +104,21 @@ class MissionControl:
         self.event_bus = event_bus
         return self
 
+    @staticmethod
+    def _status_name(value: Any) -> str:
+        if value is None:
+            return ""
+        if hasattr(value, "value"):
+            return str(value.value)
+        return str(value)
+
     def _event_summary(self) -> Dict[str, Any]:
         if self.event_bus is None:
             return {"counts": {}, "recent": [], "last": "n/a"}
-        events = self.event_bus.get(goal_id=getattr(self.goal, "goal_id", None)) if self.goal else self.event_bus.get()
+        goal_id = getattr(self.goal, "goal_id", None)
+        if goal_id is None and hasattr(self, "goal_id"):
+            goal_id = self.goal_id
+        events = self.event_bus.get(goal_id=goal_id) if goal_id else self.event_bus.get()
         counts: Dict[str, int] = {}
         for event in events:
             key = event.event_type.value
@@ -115,29 +128,55 @@ class MissionControl:
         return {"counts": counts, "recent": recent, "last": last}
 
     def snapshot(self) -> MissionSnapshot:
-        if self.goal is None:
+        goal_id = getattr(self.goal, "goal_id", None) if self.goal is not None else getattr(self, "goal_id", None)
+        if self.goal is None and not goal_id:
             return MissionSnapshot()
 
         total = len(self.tasks)
-        completed = sum(1 for t in self.tasks if getattr(t, "status", None) and str(t.status).lower() == "completed")
-        failed = sum(1 for t in self.tasks if getattr(t, "status", None) and str(t.status).lower() == "failed")
-        passed = sum(1 for e in self.evidence if getattr(e, "status", None) and str(e.status).upper() == "PASS")
-        failed_evidence = sum(1 for e in self.evidence if getattr(e, "status", None) and str(e.status).upper() == "FAIL")
+        completed = sum(
+            1
+            for t in self.tasks
+            if self._status_name(getattr(t, "status", None)).upper() == "COMPLETED"
+        )
+        failed = sum(
+            1
+            for t in self.tasks
+            if self._status_name(getattr(t, "status", None)).upper() == "FAILED"
+        )
+        passed = sum(
+            1
+            for e in self.evidence
+            if self._status_name(getattr(e, "status", None)).upper() == "PASS"
+        )
+        failed_evidence = sum(
+            1
+            for e in self.evidence
+            if self._status_name(getattr(e, "status", None)).upper() == "FAIL"
+        )
 
         progress = 0.0
         if total > 0:
             progress = (completed / total) * 100.0
 
         event_summary = self._event_summary()
+        project_id = getattr(self.goal, "project_id", None) if self.goal is not None else None
+        if self.event_bus is not None and project_id is None and goal_id:
+            for event in self.event_bus.get(goal_id=goal_id):
+                if event.project_id:
+                    project_id = event.project_id
+                    break
+
+        goal_status = getattr(self.goal, "status", "UNKNOWN") if self.goal is not None else "UNKNOWN"
+        status = (
+            goal_status.value if hasattr(goal_status, "value") else str(goal_status)
+        )
+        title = getattr(self.goal, "title", "") if self.goal is not None else ""
+
         return MissionSnapshot(
-            goal_id=getattr(self.goal, "goal_id", None),
-            project_id=getattr(self.goal, "project_id", None),
-            title=getattr(self.goal, "title", ""),
-            status=(
-                getattr(self.goal, "status", "UNKNOWN").value
-                if hasattr(getattr(self.goal, "status", None), "value")
-                else str(getattr(self.goal, "status", "UNKNOWN"))
-            ),
+            goal_id=goal_id,
+            project_id=project_id,
+            title=title,
+            status=status,
             progress_percent=progress,
             tasks_total=total,
             tasks_completed=completed,
@@ -155,8 +194,13 @@ class MissionControl:
         if not self.tasks:
             return "n/a"
         for task in self.tasks:
-            if getattr(task, "status", None) and str(task.status).lower() in {"running", "queued"}:
-                return getattr(task, "owner_agent_id", "n/a") or getattr(task, "agent_type", "n/a") or "n/a"
+            status_name = self._status_name(getattr(task, "status", None)).upper()
+            if status_name in {"RUNNING", "QUEUED"}:
+                return (
+                    getattr(task, "owner_agent_id", "n/a")
+                    or getattr(task, "agent_type", "n/a")
+                    or "n/a"
+                )
         return "idle"
 
     def _preview_status(self) -> str:
@@ -164,7 +208,8 @@ class MissionControl:
             return "not_started"
         for evidence in self.evidence:
             if getattr(evidence, "test_id", "") == "qa.preview":
-                return "passed" if str(getattr(evidence, "status", "NOT_RUN")).upper() == "PASS" else "failed"
+                status_name = self._status_name(getattr(evidence, "status", "NOT_RUN")).upper()
+                return "passed" if status_name == "PASS" else "failed"
         return "pending"
 
     def summary(self) -> Dict[str, Any]:

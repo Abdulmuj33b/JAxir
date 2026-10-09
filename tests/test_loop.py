@@ -23,6 +23,7 @@ from jaxir.loopguard import (
     failure_signature,
 )
 from jaxir.qa import QAEngine
+from jaxir.spec import GoalSpec
 from jaxir.todoslice import TodoApp
 
 
@@ -145,6 +146,38 @@ def _fb():
     return FeedbackEngine(EventBus())
 
 
+class TestGoalSpecExtraction:
+    def test_from_text_extracts_project_type_requirements_and_chains(self):
+        goal = models.Goal(project_id="todo", user_intent="Build a secure web app with preview and verification", title="")
+
+        spec = GoalSpec.from_text("proj-1", goal.user_intent, goal)
+
+        assert spec.project_type == "web"
+        assert spec.requirements
+        assert "preview" in spec.required_capabilities
+        assert "security" in spec.required_capabilities
+        assert "verification" in spec.required_capabilities
+        assert spec.permissions_required
+        assert spec.chains
+        assert spec.chains[0].requirement_id.startswith("REQ-")
+        assert spec.chains[0].acceptance_target_id.startswith("AT-")
+
+
+class TestTaskGraphScheduling:
+    def test_same_agent_type_without_shared_resource_is_not_a_conflict(self):
+        from jaxir.taskgraph import TaskGraph
+
+        tasks = [
+            models.Task(goal_id="g", owner_agent_id="coder-a", agent_type="coder",
+                        inputs={"resource": "cache-a"}),
+            models.Task(goal_id="g", owner_agent_id="coder-b", agent_type="coder",
+                        inputs={"resource": "cache-b"}),
+        ]
+
+        conflicts = TaskGraph(EventBus()).detect_conflicts(tasks, "proj")
+        assert conflicts == []
+
+
 class TestCorrectiveTasks:
     def test_equivalent_failures_collapse_to_one_cluster(self):
         fb = _fb()
@@ -197,6 +230,18 @@ class TestCorrectiveTasks:
         fb.create("p", "g", None, "qa.x", ["qa.x:FAIL"])
         payload = bus.get(event_type=models.EventType.FEEDBACK_CREATED)[0].payload
         assert payload["signature"] == failure_signature("qa.x", ["qa.x:FAIL"])
+
+    def test_feedback_accept_event_preserves_project_goal_and_task_ids(self):
+        bus = EventBus()
+        fb = FeedbackEngine(bus)
+        f = fb.create("proj-1", "goal-1", "task-1", "qa.x", ["qa.x:FAIL"])
+
+        fb.accept(f.feedback_id)
+
+        event = bus.get(event_type=models.EventType.FEEDBACK_ACCEPTED)[0]
+        assert event.project_id == "proj-1"
+        assert event.goal_id == "goal-1"
+        assert event.task_id == "task-1"
 
 
 # ----------------------------------------------------------------------
